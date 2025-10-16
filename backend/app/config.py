@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import os
+from pathlib import Path
 from typing import Final
 
 
@@ -31,6 +32,17 @@ class SecurityConfig:
 
 
 SECURITY_CONFIG: Final = SecurityConfig()
+
+
+@dataclass(frozen=True)
+class DataConfig:
+    """Configuration for persistent application storage."""
+
+    sqlite_path_env_var: str = "SEO_AUDITOR_DB_PATH"
+    default_sqlite_path: Path = Path("var/sqlite/app.db")
+
+
+DATA_CONFIG: Final = DataConfig()
 
 
 def load_hmac_secret(*, env_var: str | None = None) -> bytes:
@@ -65,3 +77,17 @@ def load_hmac_secret(*, env_var: str | None = None) -> bytes:
         raise ConfigurationError("HMAC signing secret must be at least 32 bytes.")
 
     return secret
+
+
+def resolve_sqlite_path() -> Path:
+    """Return the configured path to the SQLite database file.
+
+    The path is resolved on demand so tests can override the environment
+    variable before instantiating application components.
+    """
+
+    env_var = DATA_CONFIG.sqlite_path_env_var
+    candidate = os.environ.get(env_var)
+    if candidate:
+        return Path(candidate).expanduser().resolve()
+    return DATA_CONFIG.default_sqlite_path.expanduser().resolve()
