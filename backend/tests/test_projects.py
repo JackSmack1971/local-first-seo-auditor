@@ -109,3 +109,88 @@ def test_seed_urls_must_be_unique(client: TestClient, seed_urls: list[str]) -> N
     headers["Content-Type"] = "application/json"
     response = client.post("/projects", content=body, headers=headers)
     assert response.status_code == 422
+
+
+def test_get_project_requires_signature(client: TestClient) -> None:
+    record = _post_project(
+        client,
+        {
+            "name": "Signed Get",
+            "target": {"type": "sitemap", "sitemap_url": "https://example.com/sitemap.xml"},
+        },
+    )
+    response = client.get(f"/projects/{record['id']}")
+    assert response.status_code == 400
+    assert response.json()["detail"] == "Missing X-Nonce header."
+
+
+def test_get_project_returns_record(client: TestClient) -> None:
+    record = _post_project(
+        client,
+        {
+            "name": "Lookup",
+            "target": {"type": "sitemap", "sitemap_url": "https://example.com/sitemap.xml"},
+        },
+    )
+    handshake = perform_handshake(client)
+    headers = signed_headers(f"/projects/{record['id']}", b"", handshake["nonce"])
+    response = client.get(f"/projects/{record['id']}", headers=headers)
+    assert response.status_code == 200
+    assert response.json()["id"] == record["id"]
+
+
+def test_get_project_not_found(client: TestClient) -> None:
+    handshake = perform_handshake(client)
+    path = "/projects/does-not-exist"
+    headers = signed_headers(path, b"", handshake["nonce"])
+    response = client.get(path, headers=headers)
+    assert response.status_code == 404
+    assert response.json()["detail"] == "Project not found."
+
+
+def test_delete_project_requires_pin(client: TestClient) -> None:
+    record = _post_project(
+        client,
+        {
+            "name": "Delete Project",
+            "target": {"type": "sitemap", "sitemap_url": "https://example.com/sitemap.xml"},
+        },
+    )
+    handshake = perform_handshake(client)
+    path = f"/projects/{record['id']}"
+    headers = signed_headers(path, b"", handshake["nonce"])
+    response = client.delete(path, headers=headers)
+    assert response.status_code == 403
+    assert response.json()["detail"] == "PIN verification required for this action."
+
+
+def test_delete_project_succeeds_with_pin(client: TestClient) -> None:
+    record = _post_project(
+        client,
+        {
+            "name": "Purge",
+            "target": {"type": "sitemap", "sitemap_url": "https://example.com/sitemap.xml"},
+        },
+    )
+    handshake = perform_handshake(client)
+    path = f"/projects/{record['id']}"
+    headers = signed_headers(path, b"", handshake["nonce"])
+    headers["X-PIN-Verified"] = "true"
+    response = client.delete(path, headers=headers)
+    assert response.status_code == 204
+
+    # subsequent fetch should fail with 404 to confirm deletion
+    handshake = perform_handshake(client)
+    headers = signed_headers(path, b"", handshake["nonce"])
+    follow_up = client.get(path, headers=headers)
+    assert follow_up.status_code == 404
+
+
+def test_delete_missing_project_returns_404(client: TestClient) -> None:
+    handshake = perform_handshake(client)
+    path = "/projects/missing"
+    headers = signed_headers(path, b"", handshake["nonce"])
+    headers["X-PIN-Verified"] = "true"
+    response = client.delete(path, headers=headers)
+    assert response.status_code == 404
+    assert response.json()["detail"] == "Project not found."

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Depends, status
 
-from ..dependencies import enforce_signed_request
+from ..dependencies import enforce_pin_verification, enforce_signed_request
 from ..models import ProjectCreateRequest, ProjectResponse
 from ..repositories.projects import ProjectsRepository
 
@@ -37,3 +37,32 @@ async def list_projects(_: None = Depends(enforce_signed_request)) -> list[Proje
     """Return all stored project records ordered alphabetically."""
 
     return _repository.list_projects()
+
+
+@router.get(
+    "/{project_id}",
+    response_model=ProjectResponse,
+    summary="Retrieve a single project by identifier",
+)
+async def get_project(
+    project_id: str,
+    _: None = Depends(enforce_signed_request),
+) -> ProjectResponse:
+    """Fetch an individual project record by primary key."""
+
+    return _repository.get_project(project_id)
+
+
+@router.delete(
+    "/{project_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    summary="Delete a project and purge its artefacts",
+)
+async def delete_project(
+    project_id: str,
+    _: None = Depends(enforce_signed_request),
+    __: None = Depends(enforce_pin_verification),
+) -> None:
+    """Remove the project and associated artefacts after PIN verification."""
+
+    _repository.delete_project(project_id)
