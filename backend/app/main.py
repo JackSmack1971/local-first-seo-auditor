@@ -5,6 +5,7 @@ from __future__ import annotations
 from fastapi import FastAPI
 
 from .routes import health
+from .routes import auth
 
 
 def create_app() -> FastAPI:
@@ -18,6 +19,7 @@ def create_app() -> FastAPI:
             "request signing with rotating nonces."
         ),
     )
+    app.include_router(auth.router)
     app.include_router(health.router)
     return app
 

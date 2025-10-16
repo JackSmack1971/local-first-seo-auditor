@@ -14,8 +14,8 @@ _nonce_store = InMemoryNonceStore()
 
 async def enforce_signed_request(
     request: Request,
-    x_nonce: Annotated[str | None, Header(alias="X-Nonce")],
-    x_signature: Annotated[str | None, Header(alias="X-Signature")],
+    x_nonce: Annotated[str | None, Header(alias="X-Nonce")] = None,
+    x_signature: Annotated[str | None, Header(alias="X-Signature")] = None,
 ) -> None:
     """Validate request signatures for authenticated endpoints."""
 
