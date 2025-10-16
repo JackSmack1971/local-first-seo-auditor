@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Annotated
 
-from fastapi import Header, Request
+from fastapi import Header, HTTPException, Request, status
 
 from .security import InMemoryNonceStore, SignatureContext, verify_request_signature
 
@@ -36,3 +36,15 @@ def get_nonce_store() -> InMemoryNonceStore:
     """Expose the nonce store for other components (e.g., tests)."""
 
     return _nonce_store
+
+
+async def enforce_pin_verification(
+    x_pin_verified: Annotated[str | None, Header(alias="X-PIN-Verified")] = None,
+) -> None:
+    """Ensure the caller has completed a PIN challenge for sensitive operations."""
+
+    if x_pin_verified is None or x_pin_verified.lower() != "true":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="PIN verification required for this action.",
+        )

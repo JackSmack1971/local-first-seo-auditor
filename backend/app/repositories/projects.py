@@ -110,6 +110,37 @@ class ProjectsRepository:
 
         return [self._row_to_response(_ProjectRow(**dict(row))) for row in rows]
 
+    def get_project(self, project_id: str) -> ProjectResponse:
+        with sqlite_connection() as connection:
+            self._ensure_schema(connection)
+            row = connection.execute(
+                """
+                SELECT id, name, target_type, target_payload, created_at, updated_at,
+                       last_run_status, last_run_at, disk_usage_bytes
+                FROM projects
+                WHERE id = ?
+                """,
+                (project_id,),
+            ).fetchone()
+
+        if row is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Project not found.")
+
+        return self._row_to_response(_ProjectRow(**dict(row)))
+
+    def delete_project(self, project_id: str) -> None:
+        with sqlite_connection() as connection:
+            self._ensure_schema(connection)
+            self._purge_project_artifacts(connection, project_id)
+            cursor = connection.execute(
+                "DELETE FROM projects WHERE id = ?",
+                (project_id,),
+            )
+            deleted = cursor.rowcount
+
+        if deleted == 0:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Project not found.")
+
     def _ensure_schema(self, connection: sqlite3.Connection) -> None:
         connection.execute(
             """
@@ -158,6 +189,32 @@ class ProjectsRepository:
         if target_type == "seeds":
             return SeedListTarget(type="seeds", seed_urls=data["seed_urls"])
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Stored project target invalid.")
+
+    def _existing_tables(self, connection: sqlite3.Connection) -> set[str]:
+        rows = connection.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'",
+        ).fetchall()
+        return {row[0] for row in rows}
+
+    def _purge_project_artifacts(self, connection: sqlite3.Connection, project_id: str) -> None:
+        """Remove project-linked artefacts from auxiliary tables when available."""
+
+        cleanup_statements = {
+            "audit_run": "DELETE FROM audit_run WHERE project_id = ?",
+            "audit_metric": "DELETE FROM audit_metric WHERE project_id = ?",
+            "topic_term": "DELETE FROM topic_term WHERE project_id = ?",
+            "link_edge": "DELETE FROM link_edge WHERE project_id = ?",
+            "host_rank": "DELETE FROM host_rank WHERE project_id = ?",
+            "jobs": "DELETE FROM jobs WHERE payload_json LIKE ?",
+        }
+        existing_tables = self._existing_tables(connection)
+        for table_name, statement in cleanup_statements.items():
+            if table_name not in existing_tables:
+                continue
+            if table_name == "jobs":
+                connection.execute(statement, (f'%"project_id": "{project_id}"%',))
+            else:
+                connection.execute(statement, (project_id,))
 
 
 def iter_projects(repository: ProjectsRepository) -> Iterable[ProjectResponse]:
