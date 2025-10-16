@@ -1,0 +1,2041 @@
+Functional Requirements Document (FRD)
+Local-First SEO Auditor with AI Reasoning v1.1.6
+Document Control
+• Version: 1.1.6
+• Owner: Jack
+• Date: October 16, 2025
+• Status: Baseline for Development
+• Source PRD: PRD_251016_122340.txt
+• Target Platform: Windows 11 / WSL Desktop Application
+1. Executive Summary
+1.1 Purpose
+This FRD translates the PRD requirements into detailed functional specifications for the Local-First SEO Auditor, a privacy-focused desktop application that performs website crawling, auditing, topic research, link analysis, and AI-powered recommendations without mandatory cloud dependencies.
+1.2 Scope
+In Scope:
+• Hybrid web crawling engine (HTTP + Playwright)
+• SEO audit framework with 27+ rules
+• Topic exploration with clustering
+• Internal link graph analysis with PageRank
+• AI-powered artifacts via OpenRouter (opt-in)
+• Local-first architecture with DuckDB/SQLite storage
+• Security controls (request signing, PIN authentication, PII redaction)
+• Observability (structured logging, metrics, SLO tracking)
+Out of Scope:
+• Multi-tenant or server deployments
+• Agent frameworks with embeddings
+• SERP scraping capabilities
+• Global backlink database parity with commercial tools
+1.3 Stakeholders
+• Primary User: Jack (owner-operator, strategist, engineer)
+• Development Team: Jack + optional contractor (Playwright/Windows perf)
+• Future Users: Single-user desktop installations (no multi-user)
+2. System Overview
+2.1 Architecture Summary
+┌─────────────────────────────────────────────────┐ │ Tauri Desktop UI (React + Rust Shell) │ │ - Project Management │ │ - Run Configuration │ │ - Results Visualization │ │ - AI Artifact Display │ └────────────────┬────────────────────────────────┘ │ IPC: localhost HTTP + HMAC │ X-Nonce, X-Signature, X-Trace-Id ┌────────────────▼────────────────────────────────┐ │ FastAPI Backend (127.0.0.1:8787) │ │ - Endpoint Handlers │ │ - Request Signing Validation │ │ - Job Orchestration │ └────────────────┬────────────────────────────────┘ │ ┌────────┴────────┐ │ │ ┌───────▼──────┐ ┌──────▼───────┐ │ Worker Pool │ │ Storage │ │ - Crawlers │ │ - DuckDB │ │ - Auditors │ │ - SQLite │ │ - Topics │ │ - Parquet │ │ - Links │ │ │ │ - AI │ │ │ └──────────────┘ └──────────────┘ 
+2.2 Data Flow
+• User Action → Tauri UI sends signed request to FastAPI
+• Job Creation → SQLite jobs table (PENDING state)
+• Worker Execution → Async workers process tasks
+• Staging Queue → Workers write to SQLite staging (Option A) or direct to DuckDB (Option B)
+• Ingest Writer → Single-writer process commits batches to DuckDB
+• Results Display → UI queries DuckDB facts and displays artifacts
+3. Core Functional Requirements
+3.1 Auditor Module
+FR-AUD-001: Project Management
+Priority: MUST
+Description: Users shall create, manage, and delete SEO audit projects.
+Acceptance Criteria:
+• AC1: User can create new project with unique name (max 100 chars)
+• AC2: Project stores target configuration (sitemap URL or seed URL list)
+• AC3: User can view list of all projects with last run status and disk usage
+• AC4: PIN authentication required to delete project
+• AC5: Deletion removes all associated data from DuckDB and SQLite
+Traceability:
+• Design: Section 5 (System Architecture), Appendix C (Wireframes)
+• Tests: T-E2E-001, T-SEC-001
+FR-AUD-002: Hybrid Crawl Engine
+Priority: MUST
+Description: System shall crawl websites using HTTP-first strategy with automatic escalation to JavaScript rendering when needed.
+Functional Details:
+Input Processing:
+• Accept sitemap.xml URL or manual seed URL list
+• Parse and validate robots.txt per host
+• Support authentication patterns in robots.txt
+Crawl Strategy:
+• HTTP-First Phase:
+• Use httpx/aiohttp for initial requests
+• Parse HTML with trafilatura/selectolax
+• Extract titles, meta tags, headings, canonicals, hreflang, links
+• Calculate word count and text density
+• SPA Detection Heuristics:
+• Check for framework markers (React, Vue, Angular data attributes)
+• Measure text density ratio (text nodes / total HTML size)
+• Flag if density < threshold (configurable, default 0.15)
+• Check for previous JS requirement from cache
+• Playwright Escalation:
+• Launch headless Chromium tab (max 2 concurrent)
+• Wait for network idle (2 connections, 500ms timeout)
+• Re-extract all SEO elements after render
+• Capture optional performance traces (LCP, INP, CLS)
+• Cache JS requirement decision per domain
+Rate Limiting:
+• Per-host token bucket: 0.5 requests/second, burst 1
+• Respect Crawl-delay directive in robots.txt
+• Adaptive throttling on CPU >85% for 60 seconds
+Retry Logic:
+• Exponential backoff: 1s, 3s, 7s (max 3 attempts)
+• Retry on: 429, 503, connection timeout, DNS failure
+• Skip on: 404, 410, 403 (after robots check)
+Resource Management:
+• HTTP concurrency: max 16 parallel requests
+• Playwright tabs: max 2 concurrent (recycle every 100 pages)
+• GPU acceleration: disabled for consistency
+• Watchdog: kill orphaned browser processes after 5 minutes
+Acceptance Criteria:
+• AC1: HTTP-only crawl succeeds for static site (100 pages)
+• AC2: SPA detection triggers Playwright on framework markers
+• AC3: JS requirement cached and reused on subsequent runs
+• AC4: Robots.txt disallow rules prevent crawl attempts
+• AC5: Token bucket enforces rate limit (measured via logs)
+• AC6: Retry logic executes with correct backoff timings
+• AC7: Playwright processes recycled every 100 pages
+• AC8: Watchdog kills orphaned processes (chaos test)
+Traceability:
+• Design: Section 6, Section 7, Appendix A.4
+• Tests: T-AUD-001 to T-AUD-010, T-PERF-CRAWL-5000, CHAOS-NET
+FR-AUD-003: Audit Rule Framework
+Priority: MUST
+Description: System shall evaluate pages against a comprehensive rule set and generate evidence-based findings.
+Rule Structure: Each rule shall include:
+• ID: Unique identifier (e.g., AUD-TITLE-001)
+• Name: Human-readable label
+• Category: Indexability, Performance, UX, International, Link Flow
+• Impact Model: Formula for calculating business impact
+• Severity Calculation: Function to determine severity (Critical, High, Medium, Low)
+• Evidence Extractor: Function to capture proof of violation
+• Auto-fixable Flag: Boolean indicating if rule can be auto-corrected
+• Acceptance Criteria: Specific conditions for pass/fail
+Initial Rule Set (27 Rules):
+Indexability & Canonicals (Critical Priority):
+• AUD-TITLE-001: Missing <title> tag
+• AUD-TITLE-002: Duplicate <title> across pages
+• AUD-TITLE-003: Title length out of bounds (< 30 or > 60 chars)
+• AUD-META-001: Missing meta description
+• AUD-META-002: Meta description length out of bounds (< 120 or > 160 chars)
+• AUD-CANON-001: Multiple canonical tags on single page
+• AUD-CANON-002: Canonical points to non-200 status page
+• AUD-CANON-003: Canonical points to non-indexable page (noindex)
+• AUD-INDEX-001: Page has noindex tag
+• AUD-ROBOTS-001: Robots.txt disallows but page was crawled
+Redirects & Status Codes: 11. AUD-REDIRECT-001: Redirect chain exceeds 1 hop (3xx → 3xx) 12. AUD-STATUS-001: High frequency of 4xx/5xx errors (> 5% of crawl)
+Content Structure: 13. AUD-H1-001: Missing H1 tag 14. AUD-H1-002: Multiple H1 tags on page 15. AUD-H1-003: H1 length out of bounds (< 20 or > 70 chars) 16. AUD-CONTENT-001: Thin content (word_count < 300) 17. AUD-SIZE-001: Large HTML payload (> 2MB uncompressed) 18. AUD-MIXED-001: Mixed content (HTTPS page with HTTP resources)
+Link Architecture: 19. AUD-LINK-001: Orphan page (no internal inbound links) 20. AUD-LINK-002: Click depth exceeds threshold (> 3 from homepage) 21. AUD-LINK-003: Broken internal links (404/410 targets) 22. AUD-LINK-004: Canonicalized page still linked internally
+International SEO: 23. AUD-I18N-001: Missing or invalid hreflang tags 24. AUD-I18N-002: Hreflang points to non-canonical URL
+Performance (Lab Metrics via Playwright): 25. AUD-PERF-001: Largest Contentful Paint > 2.5 seconds 26. AUD-PERF-002: Cumulative Layout Shift > 0.25 27. AUD-PERF-003: Interaction to Next Paint > 200ms
+Acceptance Criteria:
+• AC1: All 27 rules implemented with predicates
+• AC2: Each rule returns structured evidence (URL, field, value, rationale)
+• AC3: Severity calculated consistently based on impact model
+• AC4: Auto-fixable flag accurate (verified by manual review)
+• AC5: Rules execute against golden fixture data with expected pass/fail
+Traceability:
+• Design: Section 3.1 (Rule Framework)
+• Tests: T-AUD-007 (per-rule predicates), golden fixtures comparison
+FR-AUD-004: Audit Run Delta Comparison
+Priority: MUST
+Description: System shall compare current audit run against previous run and highlight changes.
+Delta Types:
+• Added: Issue present in current run but not previous
+• Removed: Issue resolved since previous run
+• Changed: Issue severity or evidence modified
+• Stable: Issue persists unchanged
+Comparison Logic:
+• Key: (url, rule_id)
+• Compare evidence fields for changes
+• Timestamp exclusion for deterministic comparison
+• Present delta in UI with color coding
+Acceptance Criteria:
+• AC1: Delta calculation identifies all four change types
+• AC2: Comparison excludes timestamp fields
+• AC3: UI displays delta with visual indicators
+• AC4: Delta export available in CSV/JSON
+Traceability:
+• Design: Section 3.1
+• Tests: T-AUD-010, T-E2E-003
+FR-AUD-005: Performance Budget Guards
+Priority: MUST
+Description: System shall enforce resource limits during crawl to prevent system overload.
+Performance Targets:
+• Crawl Throughput: 5,000 pages in ≤ 1,800 seconds (30 minutes) on Windows 11
+• Baseline Assumption: ≥ 80% pages are static (HTTP-only)
+• Measurement Method: Fixed corpus (100 domains, 80/20 static/SPA mix), HTTP concurrency 16, Playwright tabs ≤ 2, median of 3 runs
+Resource Limits:
+Pages per Run:
+• Default: 5,000 pages
+• Configurable maximum (warn if exceeded)
+• Prompt user to reduce if >20% pages require JS
+Disk Space:
+• Warn: 15 GB remaining
+• Hard Stop: 20 GB remaining (configurable)
+• Check before crawl start and every 1,000 pages
+Memory:
+• Application RSS target: ≤ 4 GB
+• Playwright per-browser: ≤ 1.5 GB (recycle if exceeded)
+• Halt crawl if system RAM >90% for 60 seconds (prompt user)
+CPU:
+• Reduce HTTP concurrency if CPU >85% for 60 seconds
+• Sample every 10 seconds during crawl
+• Log throttling events
+Adaptive Behavior:
+• If JS pages >20%: Prompt to reduce budget to 2,000 or run per-host batches
+• If extrapolation shows 5k >1800s: Prompt to tighten SPA threshold to 90% static or extend target to 45 minutes
+Acceptance Criteria:
+• AC1: 5,000 static pages complete in ≤1,800 seconds (median of 3 runs)
+• AC2: Disk guard triggers warning at 15 GB
+• AC3: Hard stop enforced at 20 GB with user message
+• AC4: Memory halt triggered if >90% RAM for 60 seconds
+• AC5: CPU throttling reduces concurrency (log verification)
+• AC6: User prompt appears when JS ratio >20%
+Traceability:
+• Design: Section 7 (Performance Guardrails)
+• Tests: T-PERF-CRAWL-5000, T-OBS-005
+3.2 Topic Explorer Module
+FR-TOP-001: Seed Term Input
+Priority: SHOULD
+Description: Users shall input seed terms for topic research.
+Acceptance Criteria:
+• AC1: Accept comma-separated list or multi-line input
+• AC2: Trim whitespace and normalize case
+• AC3: Validate min 1, max 50 terms per run
+• AC4: Store seed terms with run metadata
+Traceability:
+• Design: Section 3.2
+• Tests: T-TOP-001
+FR-TOP-002: Wikipedia Pageviews Integration
+Priority: SHOULD
+Description: System shall fetch Wikipedia pageview data for topic research (default enabled).
+Functional Details:
+• API: Wikimedia REST API (pageviews)
+• Rate Limit: ≤ 10 requests/second (aiolimiter)
+• Time Range: Last 90 days by default
+• Normalize signals: log-scale transformation
+• Circuit Breaker: Open on 5 errors/60s, half-open after 60s
+Acceptance Criteria:
+• AC1: Fetch pageview data for seed terms
+• AC2: Rate limit enforced (verified via logs)
+• AC3: Circuit breaker trips on repeated failures
+• AC4: Degrade gracefully if API unavailable (use cached or skip)
+Traceability:
+• Design: Section 3.2, Section 11
+• Tests: T-TOP-002, CHAOS-AI-BREAKER
+FR-TOP-003: Google Trends Integration (Opt-in)
+Priority: SHOULD
+Description: System shall optionally fetch Google Trends data via pytrends library (flag-gated, default OFF).
+Functional Details:
+• Library: pytrends 4.9.1
+• Timeframe: Last 12 months
+• Rate Limit: Conservative (1 request/5 seconds)
+• Flag: User must explicitly enable in settings
+Acceptance Criteria:
+• AC1: pytrends disabled by default
+• AC2: User can toggle in settings with PIN authentication
+• AC3: Data fetched only when enabled
+• AC4: Rate limiting prevents API bans
+Traceability:
+• Design: Section 3.2, Section 12
+• Tests: T-TOP-003, T-SEC-001
+FR-TOP-004: Topic Clustering
+Priority: SHOULD
+Description: System shall cluster terms using machine learning to identify topical groups.
+Functional Details:
+• Algorithm: MiniBatchKMeans (scikit-learn 1.6.*)
+• Features: Normalized pageview/trend signals
+• Cluster Count: Auto-determine using elbow method or user-specified
+• Output: Cluster assignments with representative terms
+Acceptance Criteria:
+• AC1: Clustering produces consistent results with same seed
+• AC2: Each cluster has ≥1 representative term
+• AC3: Cluster IDs stable across runs with identical inputs
+• AC4: Seasonality note attached per cluster
+Traceability:
+• Design: Section 3.2
+• Tests: T-TOP-004, T-TOP-INT-002
+FR-TOP-005: Question Extraction
+Priority: SHOULD
+Description: System shall extract common questions related to topic clusters.
+Functional Details:
+• Source: Wikipedia article sections, search autocomplete patterns
+• Method: Pattern matching for interrogatives (who, what, when, where, why, how)
+• Output: List of questions per cluster (max 10 per cluster)
+Acceptance Criteria:
+• AC1: Extract ≥5 questions per cluster (if available)
+• AC2: Questions deduplicated
+• AC3: Questions ranked by relevance to cluster
+Traceability:
+• Design: Section 3.2
+• Tests: T-TOP-005
+FR-TOP-006: Content Brief Generation
+Priority: SHOULD
+Description: System shall generate exportable content briefs for each topic cluster.
+Brief Structure:
+• Cluster name and search intent
+• Representative terms
+• Seasonality insights
+• Related questions
+• Suggested content structure (H2/H3 outline)
+Acceptance Criteria:
+• AC1: Brief generated for each cluster
+• AC2: Export to Markdown format
+• AC3: Brief includes all required sections
+• AC4: Markdown renders correctly in external viewers
+Traceability:
+• Design: Section 3.2, Appendix C
+• Tests: T-TOP-006
+3.3 Link Graph & PageRank Module
+FR-LNK-001: Internal Link Extraction
+Priority: MUST
+Description: System shall extract all internal links during crawl and build directed graph.
+Functional Details:
+• Parse all <a href> tags from crawled HTML
+• Normalize URLs (scheme, trailing slash, fragments)
+• Filter to same-domain links
+• Store edges in link_edge table (src, dst, first_seen, last_seen)
+Acceptance Criteria:
+• AC1: All internal links extracted from HTML
+• AC2: URLs normalized consistently
+• AC3: Edges stored with timestamps
+• AC4: Self-links excluded
+Traceability:
+• Design: Section 3.3, Section 13
+• Tests: T-LNK-001
+FR-LNK-002: PageRank Calculation
+Priority: MUST
+Description: System shall compute PageRank scores for all pages in link graph.
+Algorithm Parameters:
+• Tolerance: 1e-6
+• Max Iterations: 100
+• Damping Factor: 0.85
+• Library: NetworkX 3.5
+Acceptance Criteria:
+• AC1: PageRank converges within 100 iterations (or warn)
+• AC2: Convergence flag recorded in metadata
+• AC3: Scores normalized (sum to 1.0)
+• AC4: Performance: 50k edges complete in ≤ 60 seconds
+Traceability:
+• Design: Section 3.3, Section 7
+• Tests: T-LNK-002, T-PERF-PR-50K, T-LNK-INT-003
+FR-LNK-003: Host-Level PageRank Aggregation
+Priority: MUST
+Description: System shall compute host-level PageRank when page-level graph exceeds threshold.
+Functional Details:
+• Threshold: 50,000 edges
+• Aggregate: Group links by (src_host, dst_host)
+• Compute: PageRank on host graph
+• Distribute: Proportionally to pages within each host
+Acceptance Criteria:
+• AC1: Host-graph switch triggered at 50k edges
+• AC2: Host-level scores computed correctly
+• AC3: Distribution to pages proportional to internal degree
+• AC4: User notified of switch in UI
+Traceability:
+• Design: Section 3.3, Appendix A.10
+• Tests: T-LNK-002
+FR-LNK-004: Common Crawl Integration (Opt-in)
+Priority: COULD
+Description: System shall optionally fetch external backlink data from Common Crawl (flag-gated, default OFF).
+Functional Details:
+Pre-conditions:
+• User enables flag with PIN authentication
+• Free disk space ≥ 5 GB
+• Budget: Download ≤ 200 MB WAT file
+Process:
+• Select one recent WAT file from Common Crawl index
+• Stream and parse Links section
+• Filter to in-scope hosts (from current project)
+• Aggregate: Count edges per (src_host, dst_host)
+• Stop at: 1M rows OR 5 minutes elapsed
+• Delete WAT file immediately after processing
+Safety Checks:
+• Refuse if free disk < 5 GB
+• Timeout after 5 minutes
+• Delete partial data on error
+Acceptance Criteria:
+• AC1: Common Crawl disabled by default
+• AC2: PIN required to enable
+• AC3: Disk check prevents download if < 5 GB free
+• AC4: WAT file deleted after processing
+• AC5: Timeout enforced at 5 minutes
+• AC6: Row cap enforced at 1M rows
+Traceability:
+• Design: Section 3.3, Appendix A.4
+• Tests: T-LNK-004, T-SEC-001
+FR-LNK-005: Orphan Page Detection
+Priority: MUST
+Description: System shall identify pages with no internal inbound links.
+Detection Logic:
+• Query link_edge table for pages with inbound_links = 0
+• Exclude homepage (assumed entry point)
+• Flag as AUD-LINK-001 violation
+Acceptance Criteria:
+• AC1: Orphan detection identifies all pages with 0 inbound links
+• AC2: Homepage excluded from orphan list
+• AC3: Orphan count displayed in audit summary
+Traceability:
+• Design: Section 3.1 (Audit Rule), Section 3.3
+• Tests: T-AUD-007, T-LNK-005
+FR-LNK-006: Click Depth Calculation
+Priority: MUST
+Description: System shall calculate minimum click depth from homepage to each page.
+Algorithm:
+• BFS traversal from homepage
+• Assign depth level to each page
+• Store in url_doc table (click_depth column)
+Acceptance Criteria:
+• AC1: Homepage has depth 0
+• AC2: All reachable pages assigned depth
+• AC3: Unreachable pages flagged as orphans
+• AC4: Depth > threshold triggers AUD-LINK-002 violation
+Traceability:
+• Design: Section 3.3
+• Tests: T-LNK-006
+3.4 AI Reasoning Module
+FR-AI-001: OpenRouter Integration
+Priority: MUST
+Description: System shall integrate with OpenRouter API for LLM reasoning (opt-in, user must provide API key).
+Configuration:
+• API Key: Stored in OS keyring (Windows Credential Manager)
+• Base URL: api.openrouter.ai
+• Authentication: Bearer token
+• Rate Limit: ≤ 2 parallel requests
+Acceptance Criteria:
+• AC1: API key stored securely in keyring
+• AC2: API calls authenticated with Bearer token
+• AC3: Parallel request limit enforced
+• AC4: Circuit breaker trips on repeated failures
+Traceability:
+• Design: Section 3.4, Section 12
+• Tests: T-AI-001, T-SEC-003
+FR-AI-002: Action Plan Generation
+Priority: MUST
+Description: System shall generate prioritized action plan based on audit findings.
+Input:
+• Audit run results (all rule violations)
+• Page metadata (titles, meta, performance metrics)
+Output JSON Schema:
+{ "project": "string", "summary": "string", "quick_wins": ["string"], "fixes": [{ "id": "string", "issue": "string", "impact": "high|med|low", "effort": "high|med|low", "recommended_change": "string", "steps": ["string"], "evidence": [{ "url": "https://...", "field": "lcp_ms|title|meta_desc|...", "value": {}, "rationale": "string" }], "acceptance_criteria": ["string"] }] } 
+Validation:
+• Pydantic schema with extra='forbid'
+• Repair attempts: ≤ 3
+• On failure: DEGRADED:AI mode with partial artifact
+Acceptance Criteria:
+• AC1: Valid JSON returned for audit with violations
+• AC2: Fixes prioritized by impact/effort matrix
+• AC3: Evidence includes URLs and specific field values
+• AC4: Repair attempts execute on malformed JSON
+• AC5: Partial artifact returned after 3 failed repairs
+Traceability:
+• Design: Section 8.1, Section 3.4
+• Tests: T-AI-001 to T-AI-007
+FR-AI-003: Cluster Label Generation
+Priority: MUST
+Description: System shall generate semantic labels and briefs for topic clusters.
+Input:
+• Topic clusters (IDs and representative terms)
+• Seasonality data
+Output JSON Schema:
+[{ "cluster_id": 0, "name": "string", "search_intent": "informational|commercial|transactional|navigational", "representative_terms": ["string"], "seasonality_note": "string", "content_brief_md": "string" }] 
+Acceptance Criteria:
+• AC1: Valid JSON returned for all clusters
+• AC2: Search intent classified correctly (validated manually)
+• AC3: Content brief includes H2/H3 outline
+• AC4: Markdown format renders correctly
+Traceability:
+• Design: Section 8.2, Section 3.4
+• Tests: T-AI-002, T-AI-004
+FR-AI-004: Internal Link Recommendations
+Priority: MUST
+Description: System shall recommend internal links to improve PageRank distribution.
+Input:
+• Link graph edges
+• PageRank scores
+• Content similarity signals (titles, headings)
+Output JSON Schema:
+[{ "from_url": "https://...", "to_url": "https://...", "suggested_anchor": "string", "reason": "string" }] 
+Recommendation Logic:
+• Prioritize high-authority pages linking to orphans
+• Suggest contextually relevant anchors
+• Limit: Max 10 recommendations per run
+Acceptance Criteria:
+• AC1: Valid JSON with max 10 recommendations
+• AC2: Recommendations target orphan or low-authority pages
+• AC3: Anchors contextually relevant (manual review)
+• AC4: Reason explains PageRank impact
+Traceability:
+• Design: Section 8.3, Section 3.4
+• Tests: T-AI-003
+FR-AI-005: AI Output Caching
+Priority: MUST
+Description: System shall cache AI responses to reduce costs and latency.
+Cache Key Components:
+• Model ID (e.g., anthropic/claude-sonnet-4-5)
+• Prompt version hash (SHA-256 of template)
+• Facts hash (SHA-256 of input data)
+• Version (schema version)
+Cache Behavior:
+• TTL: 7 days
+• Storage: SQLite ai_cache table
+• LRU Eviction: When cache > 200 MB
+• Bypass: "Regenerate" button logs reason and bypasses cache
+Acceptance Criteria:
+• AC1: Cache hit returns stored response instantly
+• AC2: Cache miss triggers API call and stores result
+• AC3: TTL expiry forces re-generation after 7 days
+• AC4: LRU eviction maintains size < 200 MB
+• AC5: Regenerate bypass logged with reason
+Traceability:
+• Design: Section 15 (Cache & Drift)
+• Tests: T-AI-004, T-AI-005
+FR-AI-006: AI Budget Controls
+Priority: MUST
+Description: System shall enforce budget caps to prevent runaway costs.
+Budget Parameters:
+• Hard Cap: $50 USD (default, configurable with PIN)
+• Warning Threshold: $40 USD
+• Token Estimation: Pre-call estimate ± 10% accuracy goal
+• Parallelism: Max 2 AI calls concurrently
+Cost Tracking:
+• Log tokens_in, tokens_out per call
+• Calculate cost: (tokens_in × rate_in) + (tokens_out × rate_out)
+• Accumulate per session and lifetime
+• Display estimate before AI run
+Enforcement:
+• Block AI calls when budget reached
+• Display banner with remaining budget
+• PIN required to increase budget > $10
+Acceptance Criteria:
+• AC1: Hard cap enforced (no calls when budget exhausted)
+• AC2: Warning banner at $40 threshold
+• AC3: Token estimate within ±10% of actual (measured over 20 calls)
+• AC4: Cost logged per call in metrics table
+• AC5: PIN required to increase budget
+Traceability:
+• Design: Section 20 (Cost Model)
+• Tests: T-AI-006, T-AI-COST-001, T-SEC-001
+FR-AI-007: AI Prompt Templates
+Priority: MUST
+Description: System shall use versioned prompt templates for consistent AI outputs.
+Template Storage:
+• Location: prompts/v1/{action_plan,cluster_labels,internal_links}.txt
+• Version Control: Git-tracked with version hash
+• Structure: Purpose, schema echo, constraints, temperature, max_tokens
+Template Requirements:
+• Explicit: "Return ONLY valid JSON, no HTML/tables"
+• Schema: Echo full JSON schema in prompt
+• Temperature: ≤ 0.3 for consistency
+• Max Tokens: Per-artifact limits (action_plan: 4000, cluster_labels: 2000, internal_links: 1000)
+• Extra Fields: "Do not include any fields not in schema"
+Cache Integration:
+• Prompt version hash included in cache key
+• Template changes invalidate cache
+Acceptance Criteria:
+• AC1: All three templates implemented
+• AC2: Template version hash computed correctly
+• AC3: Cache miss on template change
+• AC4: Temperature ≤ 0.3 enforced
+• AC5: Max tokens enforced per artifact type
+Traceability:
+• Design: Section 8.4 (Prompt Templates)
+• Tests: T-AI-004 (cache key includes prompt hash)
+3.5 User Experience & Accessibility
+FR-UX-001: Project Dashboard
+Priority: MUST
+Description: Users shall view and manage all SEO projects from a central dashboard.
+Dashboard Elements:
+• Project list with name, last run date, status, disk usage
+• Actions: New Project, Open, Delete (PIN-gated), Export
+• Sorting: By name, last run date, disk usage
+• Search/filter by project name
+Acceptance Criteria:
+• AC1: All projects displayed in list
+• AC2: Last run status accurate (SUCCEEDED, FAILED, RUNNING)
+• AC3: Disk usage updated in real-time during runs
+• AC4: Sort and filter functional
+• AC5: Delete requires PIN authentication
+Traceability:
+• Design: Section 3.5, Appendix C (Wireframes)
+• Tests: T-E2E-001, T-SEC-007
+FR-UX-002: Run Configuration Panel
+Priority: MUST
+Description: Users shall configure crawl and audit parameters before initiating runs.
+Configuration Options:
+Crawl Settings:
+• Target: Sitemap URL or seed URL list (textarea)
+• Budget: Max pages (default 5000)
+• Respect robots.txt: Checkbox (default enabled)
+Audit Toggles:
+• Use CrUX data: Checkbox (default OFF)
+• Use PSI data: Checkbox (default OFF)
+Topic Settings:
+• Seed terms: Multi-line input
+• Use Wikipedia: Checkbox (default ON)
+• Use Google Trends: Checkbox (default OFF, requires PIN)
+Link Settings:
+• Use Common Crawl: Checkbox (default OFF, requires PIN)
+AI Settings:
+• Generate Action Plan: Checkbox
+• Generate Cluster Labels: Checkbox
+• Generate Link Recommendations: Checkbox
+• Estimated Cost Display: Show before run if AI enabled
+Acceptance Criteria:
+• AC1: All configuration fields functional
+• AC2: PIN required for pytrends and Common Crawl
+• AC3: Token estimate displayed when AI enabled
+• AC4: Default values pre-populated
+• AC5: Validation errors shown inline
+Traceability:
+• Design: Section 3.5, Appendix C
+• Tests: T-E2E-001, T-SEC-001
+FR-UX-003: Results Visualization
+Priority: MUST
+Description: Users shall view audit results in interactive tables with filtering and export.
+Table Views:
+URL Document Table:
+• Columns: URL, Status, Title, Meta Desc, Word Count, Inbound Links, Click Depth, PageRank
+• Filters: Status code, orphans, depth > N
+• Sort: Any column ascending/descending
+• Export: CSV, JSON, Parquet
+Audit Metrics Table:
+• Columns: URL, Rule ID, Rule Name, Severity, Evidence
+• Filters: Severity, category, rule ID, URL pattern
+• Delta View: Toggle to show added/removed/changed
+• Sort: Severity, URL, rule name
+• Export: CSV, JSON
+Link Graph View:
+• Visualization: D3.js force-directed graph (for small graphs < 500 nodes)
+• Table fallback: Src, Dst, First Seen, Last Seen
+• PageRank: Color-coded nodes by score
+• Export: GraphML, edge list CSV
+Acceptance Criteria:
+• AC1: Tables load within 200ms for < 1000 rows
+• AC2: Filters apply instantly
+• AC3: Sort functional on all columns
+• AC4: Export generates valid files
+• AC5: Delta view highlights changes correctly
+• AC6: Graph visualization renders for < 500 nodes
+Traceability:
+• Design: Section 3.5, Appendix C
+• Tests: T-E2E-001, T-E2E-003
+FR-UX-004: AI Artifacts Display
+Priority: MUST
+Description: Users shall view generated AI artifacts with structured formatting.
+Display Format:
+Action Plan:
+• Summary section at top
+• Quick wins highlighted
+• Fixes in expandable cards with impact/effort badges
+• Evidence inline with URLs
+• Export to Markdown
+Cluster Labels:
+• Tabs per cluster
+• Intent badge (informational, commercial, transactional, navigational)
+• Representative terms as tags
+• Content brief in Markdown preview
+• Export all briefs to ZIP
+Internal Link Recommendations:
+• Table: From URL, To URL, Anchor, Reason
+• Preview: Hover shows PageRank impact
+• Export to CSV for implementation
+JSON Validity Indicator:
+• Green checkmark: Valid, fully parsed
+• Yellow warning: DEGRADED:AI, partial artifact
+• Red error: Failed after 3 repairs
+Acceptance Criteria:
+• AC1: All three artifact types display correctly
+• AC2: Markdown rendering functional
+• AC3: Export buttons generate valid files
+• AC4: Validity indicator accurate
+• AC5: Partial artifacts annotated clearly
+Traceability:
+• Design: Section 3.4, Section 8, Appendix C
+• Tests: T-E2E-002, T-AI-007
+FR-UX-005: Degradation Banners
+Priority: MUST
+Description: System shall display contextual banners when running in degraded mode.
+Banner Types:
+DEGRADED:AI
+• Message: "AI features unavailable. Budget exhausted or API error."
+• Action: "View Logs" button, "Increase Budget" button (PIN-gated)
+DEGRADED:DATA-SOURCES
+• Message: "External data sources unavailable. Using cached data only."
+• Action: "Retry" button, "View Logs" button
+DEGRADED:NETWORK
+• Message: "Network connectivity issues. Running offline mode."
+• Action: None (informational only)
+Budget Burn Banners:
+• 50% Error Budget: "SLO error budget 50% consumed. Review logs."
+• 100% Error Budget: "SLO error budget exhausted. Non-essential tasks paused."
+Acceptance Criteria:
+• AC1: Banner displays when entering degraded mode
+• AC2: Banner dismissible (but reappears on page load)
+• AC3: Action buttons functional
+• AC4: Budget burn banners appear at thresholds
+Traceability:
+• Design: Section 11 (Degradation), Section 9 (SLO Automation)
+• Tests: T-DGR-001 to T-DGR-004, T-OBS-004
+FR-UX-006: Error Handling & Toasts
+Priority: MUST
+Description: System shall provide user-friendly error messages with remediation guidance.
+Error Catalog (Standardized Codes):
+• ERR_CRAWL_TIMEOUT: "Crawl timeout. Reduce budget or check network."
+• ERR_AI_BUDGET: "AI budget exceeded. Increase limit or disable AI features."
+• ERR_DB_BUSY: "Database locked. Retry in a moment."
+• ERR_DISK_LOW: "Low disk space. Free up {X} GB to continue."
+• ERR_PIN_LOCKOUT: "Too many PIN attempts. Locked for 10 minutes."
+Toast Behavior:
+• Display: Top-right corner, 5 second auto-dismiss (error: 10 seconds)
+• Content: Error code, user message, remediation snippet
+• Action: "View Details" expands to show trace_id and link to logs
+• Retry: Offer retry button where applicable
+Acceptance Criteria:
+• AC1: All error codes implemented with user messages
+• AC2: Toasts display for all error conditions
+• AC3: Remediation snippets actionable
+• AC4: Trace ID links to logs UI with pre-filtered view
+Traceability:
+• Design: Section 3.5 (Error Catalog)
+• Tests: T-E2E-001 (error scenarios), CHAOS tests
+FR-A11Y-001: Keyboard Navigation
+Priority: MUST
+Description: All core user flows shall be fully keyboard-navigable.
+Keyboard Support:
+• Tab: Navigate between interactive elements
+• Shift+Tab: Reverse navigation
+• Enter/Space: Activate buttons and links
+• Escape: Close modals and dropdowns
+• Arrow Keys: Navigate within lists and tables
+Focus Management:
+• Visible focus indicator (2px solid outline, 4.5:1 contrast)
+• Focus trap in modals
+• Focus restore after modal close
+• Skip-to-content link at page top
+Acceptance Criteria:
+• AC1: All buttons and links reachable via keyboard
+• AC2: No keyboard traps (can always escape)
+• AC3: Focus indicator visible (contrast ≥ 4.5:1)
+• AC4: Modals trap focus correctly
+• AC5: Skip link functional
+Traceability:
+• Design: Section 3.5 (Accessibility)
+• Tests: T-A11Y-001 (keyboard navigation)
+FR-A11Y-002: Color Contrast
+Priority: MUST
+Description: All text and interactive elements shall meet WCAG 2.2 AA contrast requirements.
+Contrast Requirements:
+• Normal text: ≥ 4.5:1
+• Large text (≥18pt or 14pt bold): ≥ 3:1
+• Interactive elements: ≥ 3:1 against adjacent colors
+• Focus indicators: ≥ 3:1 against background
+Acceptance Criteria:
+• AC1: Automated contrast check passes for all UI states
+• AC2: Manual spot-check confirms compliance
+• AC3: Error states maintain contrast
+• AC4: Dark mode (if implemented) also compliant
+Traceability:
+• Design: Section 3.5
+• Tests: T-A11Y-002 (contrast validation)
+FR-A11Y-003: ARIA Attributes
+Priority: MUST
+Description: Complex UI components shall use appropriate ARIA attributes for screen reader support.
+ARIA Usage:
+• role: Define semantic roles (button, dialog, tablist, etc.)
+• aria-label/aria-labelledby: Provide accessible names
+• aria-describedby: Link to help text or error messages
+• aria-live: Announce dynamic content changes (toasts, progress)
+• aria-expanded/aria-controls: For accordions and dropdowns
+Acceptance Criteria:
+• AC1: All custom components have appropriate roles
+• AC2: Interactive elements have accessible names
+• AC3: Dynamic content announced via aria-live
+• AC4: Accordion states reflected in aria-expanded
+Traceability:
+• Design: Section 3.5
+• Tests: T-A11Y-003 (ARIA validation)
+FR-A11Y-004: Reduced Motion Support
+Priority: MUST
+Description: System shall respect user's reduced motion preference.
+Implementation:
+• Detect: prefers-reduced-motion: reduce media query
+• Disable: Transitions, animations, auto-playing content
+• Preserve: Functional animations (e.g., loading spinners)
+Acceptance Criteria:
+• AC1: CSS animations disabled when reduced motion detected
+• AC2: JS animations respect preference
+• AC3: Functional indicators (spinners) remain visible
+• AC4: No parallax or large motion effects
+Traceability:
+• Design: Section 3.5
+• Tests: T-A11Y-004 (reduced motion)
+FR-I18N-001: Internationalization Scaffolding
+Priority: SHOULD
+Description: System shall externalize all user-facing strings to support future localization.
+Implementation:
+• File Structure: i18n/{locale}.json (e.g., en-US.json, es-ES.json)
+• Default Locale: en-US
+• Key Format: Namespaced (e.g., ui.buttons.submit, errors.ERR_CRAWL_TIMEOUT)
+• Interpolation: Support variable substitution (e.g., {count} pages)
+Locale Switcher:
+• Location: Settings menu
+• Tech Preview: Label as "Tech Preview" in v1
+• Persist: Save preference to local storage
+Acceptance Criteria:
+• AC1: All UI strings externalized in en-US.json
+• AC2: String lookup functional via i18n library
+• AC3: Locale switcher changes language (en-US verified)
+• AC4: Interpolation works for dynamic values
+• AC5: RTL support prepared (structure only, not implemented)
+Traceability:
+• Design: Section 3.5 (i18n)
+• Tests: Manual QA for string externalization
+4. Non-Functional Requirements
+4.1 Security
+FR-SEC-001: Request Signing for IPC
+Priority: MUST
+Description: All API requests between Tauri UI and FastAPI backend shall be cryptographically signed.
+Implementation:
+Session Initialization:
+• Backend generates 32-byte random nonce per session
+• Backend generates HMAC key (32 bytes) and stores in OS keyring
+• Nonce and key identifier sent to UI on handshake
+Request Signing:
+• UI sends headers: 
+• X-Nonce: Current nonce (hex-encoded)
+• X-Signature: HMAC-SHA256(nonce || path || body)
+• X-Trace-Id: Request trace ID
+• Backend validates signature before processing
+• Return 401 on missing/invalid signature
+Nonce Rotation:
+• Every 30 minutes idle time
+• On PIN re-authentication
+• On explicit logout
+Acceptance Criteria:
+• AC1: All API calls require valid signature
+• AC2: Invalid signature returns 401
+• AC3: Nonce rotation occurs at 30-minute intervals
+• AC4: Keyring stores HMAC key securely
+• AC5: Trace ID propagated through request chain
+Traceability:
+• Design: Section 6 (IPC Security), Section 12
+• Tests: T-SEC-008 (request signing validation)
+FR-SEC-002: PIN Authentication
+Priority: MUST
+Description: Critical actions shall require PIN authentication with argon2id hashing.
+PIN Configuration:
+• First Run: User sets 6–12 digit PIN
+• Hashing: argon2id (memory=64MB, time=3, parallelism=1, 16-byte salt)
+• Storage: SQLite (hash + salt only, never plaintext PIN)
+Critical Actions (Require PIN):
+• Delete Project
+• Delete All Data
+• Export All Data
+• Change API Keys
+• Restore Backup
+• Increase AI Budget > $10
+• Toggle Common Crawl
+• Enable pytrends
+Session Management:
+• Idle Timeout: 30 minutes → prompt for PIN
+• Rate Limiting: 5 attempts per 10 minutes
+• Lockout: 10-minute lockout after 5 failed attempts
+• Bypass: None (no backdoor)
+Acceptance Criteria:
+• AC1: PIN hashed with argon2id parameters
+• AC2: Critical actions blocked without valid PIN
+• AC3: Idle timeout enforced at 30 minutes
+• AC4: Rate limit prevents brute force (5/10min)
+• AC5: Lockout triggered and displays ERR_PIN_LOCKOUT
+• AC6: PIN never logged or transmitted
+Traceability:
+• Design: Section 12 (Security), Section 26 (JSON Sidecar)
+• Tests: T-SEC-001, T-SEC-007, T-SEC-009
+FR-SEC-003: PII Redaction
+Priority: MUST
+Description: System shall redact personally identifiable information before AI processing and logging.
+PII Patterns:
+Email Addresses:
+• RFC 5322 compliant patterns
+• Support: Subdomains, plus-addressing (user+tag@domain.com)
+• Redaction: [REDACTED_EMAIL]
+Phone Numbers:
+• E.164 format: +1234567890
+• International: US/CA, EU, APAC formats
+• Optional: Spaces, dashes, parentheses
+• Redaction: [REDACTED_PHONE]
+Tokens in URLs:
+• Parameters: api_key, apikey, token, auth, bearer, sid, session, key, access_token
+• Formats: ?name=value and &name=value
+• Case-insensitive matching
+• Redaction: ?api_key=[REDACTED]
+Secrets in Headers:
+• Authorization header
+• X-API-Key header
+• Redaction: Authorization: [REDACTED]
+Unicode Homoglyph Safety:
+• Normalize Unicode before pattern matching
+• Prevent bypass via lookalike characters (e.g., Cyrillic 'а' vs Latin 'a')
+Acceptance Criteria:
+• AC1: Email patterns redacted in logs and AI inputs (20+ test vectors)
+• AC2: Phone numbers redacted (US, EU, APAC formats tested)
+• AC3: URL tokens redacted (case-insensitive)
+• AC4: Headers redacted in logs
+• AC5: Homoglyph attacks prevented (test vectors included)
+• AC6: Redaction does not corrupt valid data
+Traceability:
+• Design: Section 12 (PII Redaction)
+• Tests: T-SEC-004, T-SEC-005, T-SEC-006
+FR-SEC-004: Content Security Policy
+Priority: MUST
+Description: Tauri UI shall enforce strict Content Security Policy to prevent XSS attacks.
+CSP Directives:
+default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self' http://127.0.0.1:8787; frame-ancestors 'none'; base-uri 'none'; object-src 'none'; 
+Sanitization:
+• Backend: bleach library for HTML sanitization
+• Frontend: DOMPurify for user-generated content
+• No inline scripts or styles (except Tauri framework)
+Acceptance Criteria:
+• AC1: CSP header applied to all UI pages
+• AC2: No CSP violations in browser console (E2E test)
+• AC3: bleach sanitizes backend HTML outputs
+• AC4: DOMPurify sanitizes user inputs
+• AC5: Inline scripts blocked (verified in tests)
+Traceability:
+• Design: Section 12 (Security)
+• Tests: T-SEC-002, T-E2E-003 (CSP console clean)
+FR-SEC-005: API Key Management
+Priority: MUST
+Description: External API keys shall be stored securely in OS keyring.
+Supported APIs:
+• OpenRouter (required for AI features)
+• Optional: PSI, CrUX (if Google API key provided)
+Storage:
+• Windows: Credential Manager via keyring library
+• Never store in .env.local (only key names)
+• Retrieval: On-demand per API call
+Key Rotation:
+• UI provides "Change API Key" button (PIN-gated)
+• Old key immediately invalidated in keyring
+• New key validated before storage
+Acceptance Criteria:
+• AC1: API keys stored in Windows Credential Manager
+• AC2: Keys never logged or transmitted in plaintext
+• AC3: .env.local contains only key names, not values
+• AC4: Key change requires PIN
+• AC5: Invalid key rejected with clear error message
+Traceability:
+• Design: Section 12
+• Tests: T-SEC-003 (keyring storage)
+FR-SEC-006: Supply Chain Security
+Priority: MUST
+Description: System shall use verified dependencies with hash-pinned lockfiles.
+Implementation:
+Lockfile Generation:
+• Tool: pip-tools with pip-compile --generate-hashes
+• Format: requirements.txt with SHA-256 hashes per package
+• Install: pip install --require-hashes -r requirements.txt
+SBOM (Software Bill of Materials):
+• Format: CycloneDX JSON
+• Generation: Automated in CI
+• Contents: All direct and transitive dependencies with versions
+Vulnerability Scanning:
+• Tool: pip-audit
+• Frequency: Pre-commit hook + CI job
+• Policy: Block on HIGH or CRITICAL CVEs
+• Remediation: Patch or downgrade within 48 hours
+Quarterly Review:
+• Update dependencies
+• Re-generate SBOM
+• Re-run vulnerability scan
+• Document changes in changelog
+Acceptance Criteria:
+• AC1: Lockfile contains hashes for all packages
+• AC2: pip install --require-hashes succeeds
+• AC3: SBOM generated in CycloneDX JSON format
+• AC4: pip-audit shows 0 HIGH/CRITICAL CVEs
+• AC5: CI blocks merge on vulnerability findings
+Traceability:
+• Design: Section 12 (Supply Chain), Section 21 (Dependency Matrix)
+• Tests: AC-SCM1, AC-DEP1
+4.2 Privacy
+FR-PRIV-001: Offline-First Operation
+Priority: MUST
+Description: System shall function fully offline with all external APIs disabled.
+Offline Capabilities:
+• Crawl: HTTP-only (no PSI/CrUX)
+• Audit: All rules functional
+• Link Graph: PageRank calculation
+• Topics: Use cached Wikipedia data (if previously fetched)
+• AI: Unavailable (DEGRADED:AI banner)
+External API Controls:
+• All APIs off by default except Wikipedia
+• Toggle switches in settings
+• Banner confirms "Running in offline mode" when all disabled
+Privacy Validation:
+• With all toggles OFF: 0 external network calls (log audit)
+• Test: Monitor network traffic during offline run
+Acceptance Criteria:
+• AC1: Core features functional with all external APIs disabled
+• AC2: Zero external calls when toggles OFF (validated via logs)
+• AC3: Offline mode banner displays correctly
+• AC4: Cached data used when available
+Traceability:
+• Design: Section 1.3 (Success Metrics - Privacy)
+• Tests: T-DGR-001, network monitoring test
+FR-PRIV-002: Data Residency
+Priority: MUST
+Description: All user data shall remain on local device unless explicitly exported.
+Data Storage:
+• Location: {install_dir}/data/ and {install_dir}/storage/
+• Databases: DuckDB (facts), SQLite (jobs, cache, metrics)
+• No cloud sync or automatic uploads
+Export Controls:
+• Manual export only (CSV, JSON, Parquet)
+• Export requires PIN authentication
+• Export logs destination path and trace_id
+Acceptance Criteria:
+• AC1: All data stored locally in specified directories
+• AC2: No automatic uploads to cloud services
+• AC3: Export requires PIN
+• AC4: Export actions logged with destination
+Traceability:
+• Design: Section 4 (Privacy NFR), Section 12
+• Tests: T-SEC-001 (PIN for export), manual audit
+4.3 Performance
+FR-PERF-001: Response Time SLOs
+Priority: MUST
+Description: System shall meet defined Service Level Objectives for user-facing operations.
+SLOs:
+OperationTargetMeasurementCrawl Success Rate≥ 95% (7-day)% of pages successfully crawled without fatal errorsAI Response Timep95 ≤ 30 secondsTime from API call to parsed responseUI Interactionp95 ≤ 200 msClick to UI update (excluding network)Queue Wait Timep95 ≤ 10 secondsStaging queue to DuckDB commit latency 
+SLO Automation:
+• Background Task: Hourly evaluation of SLO attainment
+• Error Budget: Track burn rate per SLO
+• Banners: Display at 50% and 100% budget consumption
+• Degradation: Pause non-essential tasks at 100% burn
+Acceptance Criteria:
+• AC1: SLO evaluation runs hourly
+• AC2: Error budget calculated correctly
+• AC3: Banner displays at 50% threshold
+• AC4: Non-essential tasks paused at 100% burn
+• AC5: SLO metrics logged to metrics table
+Traceability:
+• Design: Section 16 (SLOs), Section 9 (Observability)
+• Tests: T-OBS-004 (slo_breach metric)
+FR-PERF-002: Database Write Performance
+Priority: MUST
+Description: System shall maintain efficient database write performance under concurrent load.
+Performance Target:
+• Staging Queue Wait: p95 ≤ 200 ms (Option A)
+• Decision Threshold: If p95 > 500 ms OR WAL errors > 2%, switch to Option B
+Option A (Default):
+• Workers → SQLite staging queue
+• Single ingest writer drains to DuckDB (100-500 row batches)
+• Batched commits per batch
+Option B (Fallback):
+• Single process writes directly to DuckDB
+• Workers send data over IPC channel
+• No staging queue
+Stress Test:
+• T-STRESS-WRITE-001: 16 workers writing concurrently
+• Measure: p95 queue wait time, WAL error rate
+• Platform: Windows 11 native and WSL
+Acceptance Criteria:
+• AC1: Option A achieves p95 ≤ 200 ms on target hardware
+• AC2: Option B fallback implemented and tested
+• AC3: Automatic switch triggered at thresholds
+• AC4: Performance documented for both Win11 and WSL
+• AC5: User notified of Option B switch with explanation
+Traceability:
+• Design: Section 6 (Write Concurrency), Section 7, Section 24 (Risks)
+• Tests: T-STRESS-WRITE-001
+FR-PERF-003: Memory Management
+Priority: MUST
+Description: System shall stay within memory limits and recycle resources appropriately.
+Memory Limits:
+• Application RSS: ≤ 4 GB target
+• Playwright per-browser: ≤ 1.5 GB (recycle if exceeded)
+• System RAM: Halt crawl if > 90% for 60 seconds
+Resource Recycling:
+• Playwright browsers: Recycle every 100 pages
+• HTTP connections: Pool with max 16 connections
+• DataFrame chunks: Process in streaming mode (avoid loading full CSVs)
+Monitoring:
+• Sample: Every 10 seconds during operations
+• Log: mem_rss_mb metric
+• Alert: User prompt if halt triggered
+Acceptance Criteria:
+• AC1: Application RSS stays ≤ 4 GB during 5k page crawl
+• AC2: Playwright browsers recycled every 100 pages (log verification)
+• AC3: Crawl halts with prompt if RAM > 90% for 60s
+• AC4: Memory leak test: No growth > 10% over 3 consecutive runs
+Traceability:
+• Design: Section 7 (Performance Guardrails)
+• Tests: T-OBS-003 (mem sampling), T-PERF-CRAWL-5000
+4.4 Observability
+FR-OBS-001: Structured Logging
+Priority: MUST
+Description: System shall emit structured logs in JSONL format with comprehensive metadata.
+Log Schema:
+{ "ts": "2025-10-16T12:34:56.789Z", "level": "INFO|WARN|ERROR", "trace_id": "uuid", "run_id": "uuid", "job_id": "uuid", "stage": "crawl|audit|topics|links|ai|ingest", "event": "page_crawled|rule_evaluated|cache_hit|...", "url": "https://...", "latency_ms": 123, "err_code": "ERR_CRAWL_TIMEOUT", "err_msg": "string", "meta": {} } 
+Log Levels:
+• DEBUG: Verbose diagnostics (disabled in production)
+• INFO: Normal operations (page crawled, rule passed)
+• WARN: Degradation, retries, rate limits
+• ERROR: Failures requiring attention
+Log Rotation:
+• File: logs/app_{YYYY-MM-DD}.jsonl
+• Rotation: Daily at midnight America/Detroit
+• Retention: 30 days (configurable)
+Acceptance Criteria:
+• AC1: All logs emit in valid JSONL format
+• AC2: Trace ID propagates through entire request chain
+• AC3: Log rotation creates new file daily
+• AC4: Retention policy enforced (30 days default)
+• AC5: Log parsing succeeds for all entries
+Traceability:
+• Design: Section 9 (Observability)
+• Tests: T-OBS-001 (trace propagation), T-OBS-002 (metrics append)
+FR-OBS-002: Metrics Collection
+Priority: MUST
+Description: System shall collect operational metrics and store in queryable format.
+Metrics Categories:
+Crawl Metrics:
+• crawl_pages_total (counter)
+• crawl_errors_total (counter)
+• crawl_rps (gauge)
+• crawl_latency_ms (histogram)
+AI Metrics:
+• ai_tokens_in (counter)
+• ai_tokens_out (counter)
+• ai_cost_usd (counter)
+• ai_latency_s (histogram)
+System Metrics:
+• queue_depth (gauge)
+• disk_used_bytes (gauge)
+• mem_rss_mb (gauge)
+• cpu_pct (gauge)
+• slo_breach (counter)
+PageRank Metrics:
+• pagerank_iter (gauge)
+• pagerank_converged (boolean)
+Storage:
+• Primary: SQLite metrics table
+• Export: CSV for analysis
+• Retention: Rolling 24 hours in-memory, 90 days in SQLite
+Acceptance Criteria:
+• AC1: All defined metrics collected and stored
+• AC2: Metrics queryable via SQLite
+• AC3: CSV export functional
+• AC4: 24-hour retention enforced
+• AC5: Metrics dashboard displays real-time values
+Traceability:
+• Design: Section 9
+• Tests: T-OBS-002, T-OBS-003
+FR-OBS-003: Metrics Dashboard
+Priority: MUST
+Description: System shall provide web-based dashboards for metrics and logs visualization.
+Metrics Dashboard (/metrics/ui):
+• Real-time gauges: CPU, Memory, Disk, Queue Depth
+• Time-series charts: Crawl RPS, AI Cost, Error Rate
+• SLO Attainment: Current status and error budget remaining
+• Refresh: Auto-refresh every 5 seconds
+Logs Dashboard (/logs/ui):
+• Filters: Trace ID, Level, Stage, Error Code, Date Range
+• Full-text Search: Across all log fields
+• Export: Filtered logs to JSON
+• Pagination: 100 entries per page
+Access:
+• Localhost only: http://127.0.0.1:8787/metrics/ui
+• No authentication required (localhost trusted)
+Acceptance Criteria:
+• AC1: Metrics dashboard displays all gauges and charts
+• AC2: Auto-refresh works (5-second interval)
+• AC3: Logs dashboard filters functional
+• AC4: Full-text search returns relevant results
+• AC5: Export generates valid JSON
+Traceability:
+• Design: Section 9, Appendix C
+• Tests: Manual QA, T-OBS-005
+FR-OBS-004: Trace ID Propagation
+Priority: MUST
+Description: System shall propagate unique trace IDs through all system components for request correlation.
+Trace ID Generation:
+• Format: UUID v4
+• Origin: Generated by UI on user action
+• Header: X-Trace-Id
+Propagation Path:
+• UI generates trace_id on button click
+• Sent in request header to FastAPI
+• Logged in FastAPI handler
+• Passed to worker processes
+• Included in all log entries
+• Stored in jobs table
+• Returned in response headers
+Acceptance Criteria:
+• AC1: Trace ID generated for all user-initiated actions
+• AC2: Trace ID appears in all related log entries
+• AC3: Trace ID queryable in logs dashboard
+• AC4: Trace ID stored in jobs table
+• AC5: No trace ID leakage across unrelated requests
+Traceability:
+• Design: Section 9, Section 6
+• Tests: T-OBS-001, T-E2E-001
+4.5 Data Management
+FR-DATA-001: Backup & Restore
+Priority: MUST
+Description: System shall automatically back up all data with on-demand restore capability.
+Backup Schedule:
+• Scheduled: Nightly at 02:00 America/Detroit (configurable)
+• On-Demand: "Backup Now" button in UI (available anytime)
+Backup Artifacts:
+• DuckDB: Copy to backups/duckdb/YYYY-MM-DD.duckdb
+• SQLite: Copy to backups/sqlite/YYYY-MM-DD.db
+• Parquet Exports: Copy to backups/parquet/YYYY-MM-DD/
+• Manifest: backups/manifest_YYYY-MM-DD.json with checksums
+Backup Process:
+• Check disk space (require ≥2× current DB size)
+• Pause active operations (after current job completes)
+• Create consistent snapshots (VACUUM INTO for SQLite)
+• Generate manifest with row counts and checksums
+• Verify integrity (sample query on backup)
+• Resume operations
+Retention:
+• Keep: 5 most recent backups per store (configurable via BACKUPS_KEEP)
+• Prune: Delete older backups automatically
+• User notification: Before pruning if manually created backups exist
+Restore Process:
+• Script: scripts/restore.ps1 --date YYYY-MM-DD
+• Validation: Checksum verification + integrity query
+• Rollback: Resume application after successful restore
+• Logging: All restore actions logged with trace_id
+Acceptance Criteria:
+• AC1: Nightly backup runs at scheduled time (02:00 Detroit)
+• AC2: On-demand backup completes successfully
+• AC3: Manifest contains accurate checksums
+• AC4: Restore script successfully restores from backup
+• AC5: Integrity queries pass post-restore
+• AC6: Retention policy enforced (5 kept, older pruned)
+• AC7: Disk space check prevents backup if insufficient space
+Traceability:
+• Design: Section 10 (Backups, DR, Atomicity)
+• Tests: T-DR-001 to T-DR-006
+FR-DATA-002: Data Retention
+Priority: MUST
+Description: System shall enforce retention policies to prevent unbounded data growth.
+Retention Policies:
+Audit Runs:
+• Time-based: Keep runs from last 90 days (configurable)
+• Count-based: Keep latest 10 runs per project (configurable)
+• Policy: Apply the MORE permissive of the two
+AI Cache:
+• TTL: 7 days from creation
+• Size-based: LRU eviction when cache > 200 MB
+Logs:
+• File retention: 30 days (configurable)
+• SQLite metrics: 90 days (configurable)
+Pruning Schedule:
+• Frequency: Daily at 03:00 America/Detroit
+• Process: Delete expired records, VACUUM databases
+• Logging: Record pruned counts per table
+User Override:
+• Settings: Allow user to adjust retention days
+• Warning: Notify if disk usage high despite retention
+Acceptance Criteria:
+• AC1: Runs older than 90 days pruned (if >10 runs exist)
+• AC2: Latest 10 runs always retained
+• AC3: AI cache entries deleted after 7 days
+• AC4: LRU eviction maintains cache < 200 MB
+• AC5: Log files deleted after 30 days
+• AC6: Pruning runs daily at scheduled time
+• AC7: User can configure retention days in settings
+Traceability:
+• Design: Section 13 (Retention)
+• Tests: T-DR-004, T-DR-005
+FR-DATA-003: Data Determinism
+Priority: MUST
+Description: System shall produce reproducible results given identical inputs.
+Determinism Requirements:
+Facts Tables:
+• Given: Same sitemap, same robots.txt, same crawl settings
+• Output: Byte-identical facts after stable projection and timestamp nulling
+Stable Projection:
+• Column Order: Schema-defined order (not insertion order)
+• Sort: Deterministic sort by (url, rule_id) for comparisons
+• Timestamps: Excluded from comparison (null in determinism tests)
+Exclusions from Determinism:
+• Timestamps: created_at, updated_at, last_crawled
+• Run IDs: UUIDs (unique per run)
+• Trace IDs: UUIDs (unique per request)
+• External API responses: May vary (use mocked data in tests)
+Testing:
+• Run crawl twice with identical inputs
+• Export facts to Parquet
+• Apply stable projection and timestamp nulling
+• Byte-compare files
+Acceptance Criteria:
+• AC1: Facts tables byte-identical after stable projection + timestamp nulling
+• AC2: Determinism test passes for golden fixtures
+• AC3: External API variance documented in test report
+• AC4: Non-deterministic fields excluded from comparison
+Traceability:
+• Design: Section 4 (NFR - Determinism), Section 1.3 (Success Metrics)
+• Tests: T-E2E-003 (determinism byte-compare)
+FR-DATA-004: Database Schema Migrations
+Priority: MUST
+Description: System shall support schema migrations with rollback capability.
+Migration Framework:
+• Format: Numbered SQL files (e.g., 001_add_lcp_column.sql)
+• Schema Version: Stored in _schema_version table
+• Direction: Up (apply) and Down (rollback) scripts
+Migration Process:
+• Check current schema version
+• Identify pending migrations
+• Run dry-run (validate SQL syntax)
+• Apply migrations in transaction
+• Update schema version
+• Run integrity checks
+• Rollback on failure
+Migration Rules:
+• Idempotent: Safe to run multiple times (use IF NOT EXISTS)
+• Backward Compatible: Minor updates don't break existing code
+• Data Preservation: Migrations never delete user data without confirmation
+Rollback:
+• Automatic: On failed integrity check
+• Manual: scripts/migrate.ps1 --rollback --to-version N
+Acceptance Criteria:
+• AC1: Schema version tracked in database
+• AC2: Migrations applied in order
+• AC3: Dry-run detects SQL errors before execution
+• AC4: Rollback restores previous schema
+• AC5: Integrity checks pass post-migration
+• AC6: Idempotent migrations safe to re-run
+Traceability:
+• Design: Section 16 (Migrations)
+• Tests: T-DB-MIG-001 to T-DB-MIG-003
+4.6 Reliability
+FR-REL-001: Circuit Breakers
+Priority: MUST
+Description: System shall use circuit breakers to prevent cascading failures when external APIs fail.
+Circuit Breaker Configuration:
+• Library: pybreaker
+• Threshold: Open on 5 errors within 60 seconds
+• Recovery: Half-open after 60 seconds, close on 1 success
+• Per-API: Separate breakers for OpenRouter, Wikipedia, pytrends, PSI, CrUX
+States:
+• Closed: Normal operation, requests pass through
+• Open: Fail fast, return cached data or error
+• Half-Open: Test with single request, close on success or re-open on failure
+User Feedback:
+• Banner: "API [name] unavailable. Using degraded mode."
+• Retry Button: Attempt to close circuit (manual reset)
+• Logs: Circuit state changes logged with trace_id
+Acceptance Criteria:
+• AC1: Circuit opens after 5 errors in 60 seconds
+• AC2: Half-open state allows test request after 60 seconds
+• AC3: Circuit closes on successful test request
+• AC4: Fail-fast in open state (no actual API calls)
+• AC5: User banner displays when circuit open
+• AC6: Manual retry button triggers half-open attempt
+Traceability:
+• Design: Section 11 (Degradation & Circuit Breakers)
+• Tests: CHAOS-AI-BREAKER, T-DGR-002
+FR-REL-002: Job State Management
+Priority: MUST
+Description: System shall robustly manage job lifecycle with recovery from failures.
+Job States:
+• PENDING: Queued, not started
+• STARTING: Initialization in progress
+• RUNNING: Active execution
+• PAUSED: User-initiated pause
+• SUCCEEDED: Completed successfully
+• FAILED: Unrecoverable error
+• CANCELLED: User-initiated cancellation
+• FAILED_RECOVERABLE: Recoverable error, can retry
+State Transitions:
+PENDING → STARTING → RUNNING → {PAUSED, SUCCEEDED, FAILED, CANCELLED} ↓ FAILED_RECOVERABLE → PENDING (retry) 
+Heartbeat:
+• Frequency: Every 15 seconds while RUNNING
+• Stale Detection: RUNNING > 60 minutes without heartbeat → FAILED_RECOVERABLE
+• Recovery: Watchdog process moves stale jobs to FAILED_RECOVERABLE queue
+Retry Logic:
+• Max Attempts: 3 per job
+• Backoff: Exponential (1 min, 5 min, 15 min)
+• Reason Logging: Each retry logs reason and attempt count
+Acceptance Criteria:
+• AC1: All state transitions follow defined paths
+• AC2: Heartbeat updates every 15 seconds
+• AC3: Stale jobs detected and moved to FAILED_RECOVERABLE
+• AC4: Retry logic executes with correct backoff
+• AC5: Max attempts enforced (no infinite retries)
+• AC6: Job state queryable via API
+Traceability:
+• Design: Section 6 (Jobs)
+• Tests: CHAOS-worker-kill, T-AUD-INT-001
+FR-REL-003: Graceful Degradation
+Priority: MUST
+Description: System shall remain partially functional when external dependencies fail.
+Degradation Modes:
+DEGRADED:AI
+• Trigger: OpenRouter circuit open, budget exhausted, or API key invalid
+• Impact: AI features disabled, artifacts unavailable
+• Functionality Retained: Crawl, audit, topics (cached), link graph
+• Banner: "AI features unavailable. [reason]"
+DEGRADED:DATA-SOURCES
+• Trigger: Wikipedia/pytrends circuit open
+• Impact: Topic research limited to cached data
+• Functionality Retained: All other features
+• Banner: "External data sources unavailable. Using cached data."
+DEGRADED:NETWORK
+• Trigger: Network connectivity lost
+• Impact: All external APIs unavailable
+• Functionality Retained: Fully offline operation (crawl local files, audit, link graph)
+• Banner: "Network unavailable. Running in offline mode."
+Partial Results:
+• AI failures: Return partial artifacts with annotations
+• Crawl failures: Continue with remaining URLs, summarize failures
+• Topic failures: Use cached data with staleness warning
+Acceptance Criteria:
+• AC1: System remains operational in all degradation modes
+• AC2: Banners accurately reflect degradation state
+• AC3: Partial results annotated clearly
+• AC4: Degradation logged with reason and trace_id
+• AC5: User can continue work in degraded mode
+Traceability:
+• Design: Section 11
+• Tests: T-DGR-001 to T-DGR-004, CHAOS-NET
+5. Integration Requirements
+FR-INT-001: OpenRouter API Integration
+Priority: MUST
+Description: System shall integrate with OpenRouter API for LLM inference.
+API Endpoints:
+• Base URL: https://api.openrouter.ai/v1
+• Chat Completions: POST /chat/completions
+Request Format:
+{ "model": "anthropic/claude-sonnet-4-5", "messages": [{"role": "user", "content": "..."}], "temperature": 0.3, "max_tokens": 4000, "response_format": {"type": "json_object"} } 
+Response Handling:
+• Parse JSON response
+• Extract usage metrics (tokens_in, tokens_out)
+• Calculate cost based on model pricing
+• Cache response with TTL
+Error Handling:
+• 429 (Rate Limit): Exponential backoff, trigger circuit breaker
+• 500/502 (Server Error): Retry 3 times, then circuit breaker
+• 401 (Unauthorized): Prompt user to check API key
+• 400 (Bad Request): Log request for debugging, fail gracefully
+Acceptance Criteria:
+• AC1: Successful API call returns parsed response
+• AC2: Usage metrics extracted and logged
+• AC3: Cost calculated correctly
+• AC4: Error handling covers all documented error codes
+• AC5: Circuit breaker trips on repeated failures
+Traceability:
+• Design: Section 3.4, Section 14
+• Tests: T-AI-001, CHAOS-AI-BREAKER
+FR-INT-002: Wikipedia Pageviews API
+Priority: SHOULD
+Description: System shall integrate with Wikimedia REST API for pageview data.
+API Endpoints:
+• Base: https://wikimedia.org/api/rest_v1
+• Pageviews: GET /metrics/pageviews/per-article/{project}/all-access/user/{article}/daily/{start}/{end}
+Rate Limiting:
+• Limit: 10 requests per second
+• Implementation: aiolimiter
+• User-Agent: Required, set to "LocalSEOAuditor/1.1.6 (contact@example.com)"
+Data Processing:
+• Extract view counts per day
+• Normalize: Log-scale transformation
+• Aggregate: Sum over time range (default 90 days)
+Caching:
+• Cache pageview data for 24 hours
+• Key: article name + date range
+• Invalidation: TTL-based
+Acceptance Criteria:
+• AC1: Pageview data fetched successfully
+• AC2: Rate limit enforced (≤10 req/s)
+• AC3: User-Agent header set correctly
+• AC4: Data normalized with log-scale
+• AC5: Cache reduces redundant API calls
+Traceability:
+• Design: Section 3.2
+• Tests: T-TOP-002, T-TOP-INT-002
+FR-INT-003: Google Trends (pytrends) Integration
+Priority: SHOULD
+Description: System shall optionally integrate with Google Trends via pytrends library.
+Library Configuration:
+• Library: pytrends 4.9.1
+• Rate Limiting: 1 request per 5 seconds (conservative)
+• Retry: 3 attempts with exponential backoff
+Data Fetching:
+• Method: TrendReq().interest_over_time()
+• Timeframe: 'today 12-m' (last 12 months)
+• Geo: Configurable (default: worldwide)
+Safety:
+• Default: Disabled (flag OFF)
+• Enable: Requires PIN authentication
+• Disclaimer: Show Google TOS link before first use
+Acceptance Criteria:
+• AC1: pytrends disabled by default
+• AC2: PIN required to enable
+• AC3: Rate limiting prevents bans
+• AC4: Data fetched successfully when enabled
+• AC5: TOS disclaimer shown before first use
+Traceability:
+• Design: Section 3.2, Section 12
+• Tests: T-TOP-003, T-SEC-001
+6. Testing Requirements
+FR-TEST-001: Unit Test Coverage
+Priority: MUST
+Description: System shall maintain ≥80% code coverage for core modules.
+Core Modules (Coverage Required):
+• Crawl engine (HTTP + Playwright)
+• Audit rule framework
+• Link graph & PageRank
+• AI schema validation
+• Security (PIN, PII redaction, request signing)
+• Data ingestion (staging → DuckDB)
+Test Framework:
+• Python: pytest
+• Mocking: pytest-mock, responses
+• Fixtures: Shared fixtures in tests/conftest.py
+Coverage Measurement:
+• Tool: pytest-cov
+• Report: HTML + terminal summary
+• CI Gate: Block merge if coverage < 80%
+Acceptance Criteria:
+• AC1: Core modules achieve ≥80% coverage
+• AC2: Coverage report generated on each test run
+• AC3: CI blocks merge below threshold
+• AC4: Uncovered lines documented as deliberate exclusions
+Traceability:
+• Design: Section 17 (Test Strategy)
+• Tests: AC-T1, all T-* test IDs
+FR-TEST-002: Integration Tests
+Priority: MUST
+Description: System shall validate end-to-end data flows through integration tests.
+Integration Test Scenarios:
+T-AUD-INT-001: Crawl → Staging → DuckDB
+• Execute: Crawl 10 pages, write to staging, ingest to DuckDB
+• Validate: Row counts match, data integrity preserved, tx boundaries honored
+T-TOP-INT-002: Topics with Mocked Sources
+• Execute: Fetch Wikipedia data (mocked), cluster terms
+• Validate: Clusters stable, representative terms correct
+T-LNK-INT-003: Edges → PageRank
+• Execute: Extract links, build graph, compute PageRank
+• Validate: Convergence flag set, scores normalized
+Test Environment:
+• Databases: In-memory SQLite, ephemeral DuckDB
+• External APIs: Mocked responses
+• Cleanup: Teardown after each test
+Acceptance Criteria:
+• AC1: All integration tests pass
+• AC2: Tests use isolated databases
+• AC3: Mocks cover all external dependencies
+• AC4: Tests complete in <10 seconds each
+Traceability:
+• Design: Section 17
+• Tests: T-AUD-INT-001, T-TOP-INT-002, T-LNK-INT-003
+FR-TEST-003: End-to-End Tests
+Priority: MUST
+Description: System shall validate complete user workflows through E2E tests.
+E2E Test Scenarios:
+T-E2E-001: Crawl Button → Artifacts
+• Steps: Create project, configure crawl, click "Run Crawl", wait for completion, view results
+• Validate: UI shows success status, results table populated, exports available
+T-E2E-002: AI Flow (Mocked)
+• Steps: Run audit, click "Generate Action Plan", wait for AI response
+• Validate: Action plan artifact displays, JSON valid, export functional
+T-E2E-003: Determinism
+• Steps: Run crawl twice with identical inputs, export facts to Parquet
+• Validate: Byte-identical files after stable projection + timestamp nulling
+Test Framework:
+• UI Automation: Playwright (for Tauri app)
+• Backend: Live FastAPI instance
+• Databases: Test databases (cleared between runs)
+Acceptance Criteria:
+• AC1: All E2E tests pass reliably
+• AC2: Tests cover critical user journeys
+• AC3: UI assertions validate visible elements
+• AC4: CSP console clean (no violations)
+• AC5: Determinism test passes
+Traceability:
+• Design: Section 17
+• Tests: T-E2E-001 to T-E2E-003, T-A11Y-001 to T-A11Y-004
+FR-TEST-004: Performance Tests
+Priority: MUST
+Description: System shall validate performance targets through automated benchmarks.
+Performance Test Scenarios:
+T-PERF-CRAWL-5000:
+• Corpus: 100 domains, 5000 pages (80% static, 20% SPA)
+• Settings: HTTP concurrency 16, Playwright tabs 2
+• Target: ≤1800 seconds (30 minutes)
+• Measurement: Median of 3 runs
+T-PERF-PR-50K:
+• Graph: 50,000 edges
+• Algorithm: PageRank (tol 1e-6, max_iter 100)
+• Target: ≤60 seconds, convergence achieved
+T-STRESS-WRITE-001:
+• Workers: 16 concurrent writing to staging
+• Duration: 5 minutes sustained load
+• Target: p95 queue wait ≤200ms, WAL errors <2%
+Regression Gate:
+• Threshold: >10% p95 latency increase blocks merge
+• Baseline: Stored in test fixtures
+• Report: Performance trends over time
+Acceptance Criteria:
+• AC1: T-PERF-CRAWL-5000 completes in ≤1800s (median)
+• AC2: T-PERF-PR-50K completes in ≤60s with convergence
+• AC3: T-STRESS-WRITE-001 meets targets on Win11 and WSL
+• AC4: Regression gate enforced in CI
+• AC5: Performance report generated per test run
+Traceability:
+• Design: Section 7, Section 17
+• Tests: T-PERF-CRAWL-5000, T-PERF-PR-50K, T-STRESS-WRITE-001
+FR-TEST-005: Chaos Testing
+Priority: MUST
+Description: System shall validate resilience through automated chaos scenarios.
+Chaos Scenarios:
+CHAOS-AI-BREAKER:
+• Fault: OpenRouter returns 429/500 repeatedly
+• Expected: Circuit breaker opens, banner displays, fail-fast behavior
+CHAOS-NET:
+• Fault: Network connection severed mid-crawl
+• Expected: Degrade to offline mode, continue with local data, no crash
+CHAOS-worker-kill:
+• Fault: Kill crawl worker process during execution
+• Expected: Job marked FAILED_RECOVERABLE, watchdog detects stale, successful retry
+CHAOS-DB-lock:
+• Fault: Lock DuckDB file externally during write
+• Expected: Retry with backoff, user prompt with remediation
+Orchestration:
+• Script: scripts/chaos_runner.py
+• Configuration: YAML scenario definitions with timing, assertions
+• Output: JUnit XML for CI integration
+Acceptance Criteria:
+• AC1: All chaos scenarios execute successfully
+• AC2: System recovers gracefully without crashes
+• AC3: User notifications appropriate for each fault
+• AC4: JUnit XML output valid
+• AC5: Chaos tests run in CI (optional: manual trigger)
+Traceability:
+• Design: Section 17 (Chaos)
+• Tests: CHAOS-* scenarios
+7. Deployment Requirements
+FR-DEPLOY-001: Installer Package
+Priority: MUST
+Description: System shall provide Windows MSI installer with automated setup.
+Installer Contents:
+• Tauri application binaries
+• Python runtime (embedded or system check)
+• FastAPI backend
+• DuckDB/SQLite libraries
+• Playwright browser binaries
+First-Run Wizard:
+• Welcome screen
+• License agreement
+• Installation directory selection
+• Keyring setup (Windows Credential Manager)
+• Firewall rule creation (localhost:8787)
+• Playwright install --with-deps
+• PIN creation
+Directory Structure:
+{install_dir}/ ├── bin/ # Executables ├── data/ # User databases ├── storage/ # DuckDB files ├── backups/ # Backup artifacts ├── logs/ # Log files ├── metrics/ # Metrics data ├── artifacts/ # Exported artifacts └── prompts/ # AI prompt templates 
+Acceptance Criteria:
+• AC1: MSI installs without errors on clean Windows 11
+• AC2: First-run wizard completes all setup steps
+• AC3: Directories created with correct permissions
+• AC4: Application launches successfully after install
+• AC5: Uninstaller removes all files (except user data if opted)
+Traceability:
+• Design: Section 25 (Packaging)
+• Tests: Manual QA on fresh Windows 11 VM
+FR-DEPLOY-002: Code Signing
+Priority: COULD
+Description: System should provide code-signed binaries for Windows SmartScreen trust.
+Implementation:
+• Target: Windows code signing certificate by M5
+• Interim: Display SHA-256 hash in UI with verification steps
+• Process: Sign MSI and executables with EV certificate
+User Guidance (Unsigned):
+• Message: "This installer is not yet code-signed. Verify SHA-256: {hash}"
+• Link: Documentation with manual verification steps
+• Warning: Acknowledge SmartScreen warnings
+Acceptance Criteria:
+• AC1: SHA-256 hash displayed prominently in UI
+• AC2: Documentation includes verification instructions
+• AC3: Code signing implemented by M5 (stretch goal)
+Traceability:
+• Design: Section 25, Section 12
+• Tests: Manual verification
+FR-DEPLOY-003: WSL Compatibility
+Priority: MUST
+Description: System shall function correctly in Windows Subsystem for Linux (WSL).
+WSL-Specific Considerations:
+• Paths: Use pathlib.Path for cross-platform compatibility
+• Database Paths: POSIX-style in DB, converted for Windows access
+• File System: Prefer WSL FS (/home/user/) for hot data (performance)
+• Playwright: Requires --with-deps flag for browser dependencies
+Performance Baseline:
+• Measure: T-PERF-CRAWL-5000 on both Win11 native and WSL
+• Compare: If WSL ≥20% faster, installer recommends WSL
+• Documentation: Include WSL setup instructions
+Acceptance Criteria:
+• AC1: Application runs without errors in WSL
+• AC2: Performance baseline measured on WSL
+• AC3: Path handling works correctly on WSL
+• AC4: Installer includes WSL recommendation if faster
+• AC5: Documentation covers WSL setup
+Traceability:
+• Design: Section 19 (Windows & WSL)
+• Tests: T-PERF-CRAWL-5000 (Win11 + WSL), T-STRESS-WRITE-001 (both)
+8. Documentation Requirements
+FR-DOC-001: User Documentation
+Priority: MUST
+Description: System shall provide comprehensive user documentation.
+Documentation Deliverables:
+User Guide:
+• Getting Started: Installation, first project
+• Crawl Configuration: Sitemap vs seed URLs, robots.txt
+• Audit Rules: Explanation of all 27 rules with examples
+• Topic Research: Wikipedia vs pytrends, clustering
+• Link Analysis: PageRank interpretation, recommendations
+• AI Features: Budget setup, artifact interpretation
+• Settings: Privacy toggles, performance tuning
+• Troubleshooting: Common errors and solutions
+API Reference:
+• All endpoints documented with request/response examples
+• Authentication: Request signing explanation
+• Error Codes: Complete catalog with remediation
+Runbooks:
+• Implemented scenarios (18+): Playwright won't start, OpenRouter errors, disk full, migration rollback, high contention, ingest writer crash, PIN lockout, request signature failures
+Format:
+• Primary: Markdown in docs/ directory
+• Secondary: In-app help links to local docs
+Acceptance Criteria:
+• AC1: User guide covers all major features
+• AC2: API reference complete for all endpoints
+• AC3: Runbooks implemented for 18+ scenarios
+• AC4: Documentation up-to-date with v1.1.6
+• AC5: In-app help links functional
+Traceability:
+• Design: Section 18 (Runbooks)
+• Tests: Manual review
+FR-DOC-002: Developer Documentation
+Priority: SHOULD
+Description: System shall provide developer documentation for contributors.
+Developer Documentation:
+Architecture Overview:
+• System components and interactions
+• Data flow diagrams
+• Technology stack rationale
+Development Setup:
+• Environment setup (Windows, WSL)
+• Dependency installation
+• Running tests locally
+• Debugging tips
+Code Contribution:
+• Git workflow
+• Code style guide (PEP 8, ESLint config)
+• Pull request checklist
+• Test requirements
+Database Schema:
+• ER diagrams
+• Table definitions
+• Migration procedures
+Acceptance Criteria:
+• AC1: Architecture documented with diagrams
+• AC2: Setup instructions tested on fresh environment
+• AC3: Contribution guidelines clear
+• AC4: Schema documented
+Traceability:
+• Design: Appendix A (Architecture)
+• Tests: N/A (documentation quality manual review)
+9. Appendices
+Appendix A: Requirements Traceability Matrix
+Requirement IDCategoryDesign ReferenceTest IDsPriorityFR-AUD-001Auditor§5, Appendix CT-E2E-001, T-SEC-001MUSTFR-AUD-002Auditor§6, §7, Appendix A.4T-AUD-001 to T-AUD-010, T-PERF-CRAWL-5000, CHAOS-NETMUSTFR-AUD-003Auditor§3.1T-AUD-007, golden fixturesMUSTFR-AUD-004Auditor§3.1T-AUD-010, T-E2E-003MUSTFR-AUD-005Auditor§7T-PERF-CRAWL-5000, T-OBS-005MUSTFR-TOP-001 to FR-TOP-006Topics§3.2, A.7T-TOP-001 to T-TOP-006, T-TOP-INT-002SHOULDFR-LNK-001 to FR-LNK-006Link Graph§3.3, §7, A.10T-LNK-001 to T-LNK-006, T-PERF-PR-50K, T-LNK-INT-003MUSTFR-AI-001 to FR-AI-007AI Reasoning§3.4, §8, §14, §15, §20T-AI-001 to T-AI-007, T-AI-COST-001, CHAOS-AI-BREAKERMUSTFR-UX-001 to FR-UX-006User Experience§3.5, Appendix CT-E2E-001 to T-E2E-003, T-DGR-001 to T-DGR-004MUSTFR-A11Y-001 to FR-A11Y-004Accessibility§3.5T-A11Y-001 to T-A11Y-004MUSTFR-I18N-001Internationalization§3.5Manual QASHOULDFR-SEC-001 to FR-SEC-006Security§6, §12, §21T-SEC-001 to T-SEC-009, AC-SCM1MUSTFR-PRIV-001 to FR-PRIV-002Privacy§4, §12T-DGR-001, manual auditMUSTFR-PERF-001 to FR-PERF-003Performance§7, §9, §16T-PERF-*, T-STRESS-WRITE-001, T-OBS-003MUSTFR-OBS-001 to FR-OBS-004Observability§9T-OBS-001 to T-OBS-005MUSTFR-DATA-001 to FR-DATA-004Data Management§10, §13, §16T-DR-001 to T-DR-006, T-DB-MIG-001 to T-DB-MIG-003, T-E2E-003MUSTFR-REL-001 to FR-REL-003Reliability§6, §11CHAOS-*, T-DGR-001 to T-DGR-004, T-AUD-INT-001MUSTFR-INT-001 to FR-INT-003Integration§3.2, §3.4, §14T-AI-001, T-TOP-002, T-TOP-003, CHAOS-AI-BREAKERMUST/SHOULDFR-TEST-001 to FR-TEST-005Testing§17All T-* and CHAOS-* test IDs, AC-T1MUSTFR-DEPLOY-001 to FR-DEPLOY-003Deployment§19, §25Manual QA, T-PERF-CRAWL-5000 (both platforms)MUST/COULDFR-DOC-001 to FR-DOC-002Documentation§18, Appendix AManual reviewMUST/SHOULD 
+Appendix B: Data Flow Diagrams
+Crawl Data Flow:
+User Action (UI) → POST /crawl/run (FastAPI) → Job Created (SQLite jobs table, state=PENDING) → Worker Pool (async processes per domain) → HTTP Request (httpx/aiohttp) → SPA Detection Heuristics → [If JS required] → Playwright (headless Chromium) → Extract SEO Elements → Write to Staging Queue (SQLite duck_ingest_queue) → Ingest Writer (single-writer process) → Batch Commit to DuckDB (url_doc table) → Job Complete (state=SUCCEEDED) → UI Poll → Display Results 
+AI Artifact Generation Flow:
+User Action (Generate Action Plan) → POST /ai/audit-plan (FastAPI) → Check Cache (ai_cache table, key=model+prompt_hash+facts_hash) → [Cache Miss] → OpenRouter API Call → Circuit Breaker Check → [Closed] → API Request → JSON Response → Schema Validation (Pydantic extra='forbid') → [Valid] → Store Cache → Return Artifact → [Invalid] → Repair Attempts (≤3) → [Still Invalid] → DEGRADED:AI → Partial Artifact → [Cache Hit] → Return Cached Artifact 
+Backup Flow:
+Scheduled Trigger (02:00 Detroit) OR On-Demand Button → Check Disk Space (≥2× current DB size) → [Sufficient] → Pause Active Operations → Create Snapshots (VACUUM INTO for SQLite) → Generate Manifest (checksums, row counts) → Verify Integrity (sample queries) → [Pass] → Resume Operations → Log Success → [Fail] → Rollback → Alert User → [Insufficient] → Display ERR_DISK_LOW → Abort 
+Appendix C: User Journey Maps
+Journey J1: Owner-Operator Audit Flow
+Goal: Audit own site and apply prioritized fixes Steps: 1. [Dashboard] Click "New Project" → Enter name "My Website" 2. [Run Panel] Enter sitemap URL "https://example.com/sitemap.xml" 3. [Run Panel] Set budget to 5000 pages, enable "Respect robots.txt" 4. [Run Panel] Toggle "Generate Action Plan" (AI) 5. [Run Panel] Review token estimate → Click "Start Crawl" 6. [Progress] Watch real-time progress (pages/second, errors) 7. [Results] View url_doc table → Filter by status=200 8. [Results] Switch to Audit Metrics → Sort by severity=Critical 9. [AI Artifacts] Review Action Plan → Expand "Quick Wins" 10. [Export] Click "Export to Markdown" → Save locally 11. [Apply Fixes] Use external tools to implement recommendations 12. [Re-run] Click "Run Crawl" again → View delta comparison Touchpoints: Dashboard, Run Panel, Progress View, Results Tables, AI Artifacts, Export Pain Points: Long crawl times for large sites, AI cost uncertainty Success Criteria: Action plan generated, fixes prioritized, delta shows improvements 
+Journey J2: Strategist Topic Research Flow
+Goal: Cluster topics, label intents, generate briefs Steps: 1. [Dashboard] Open existing project or create new 2. [Topics Tab] Enter seed terms (comma-separated): "seo tools, backlink analysis, keyword research" 3. [Topics Tab] Enable Wikipedia (default ON), optionally enable pytrends (PIN required) 4. [Topics Tab] Click "Run Topic Research" 5. [Progress] Watch clustering progress 6. [Results] View clusters with representative terms 7. [Results] Review seasonality notes per cluster 8. [AI Artifacts] Toggle "Generate Cluster Labels" → Review search intent classifications 9. [Content Briefs] Expand each cluster → Read Markdown brief with H2/H3 outline 10. [Export] Click "Export All Briefs" → Download ZIP file 11. [Content Creation] Use briefs to guide content strategy Touchpoints: Dashboard, Topics Tab, Progress View, Results, AI Artifacts, Export Pain Points: pytrends rate limiting, Google TOS concerns Success Criteria: Clusters labeled with intent, briefs exportable, actionable insights 
+Journey J3: Engineer Internal Link Optimization Flow
+Goal: Analyze internal link flow and apply targeted links Steps: 1. [Dashboard] Open project with completed crawl 2. [Links Tab] Click "Compute PageRank" 3. [Progress] Watch convergence iterations 4. [Results] View link graph table → Sort by PageRank descending 5. [Results] Filter to orphan pages (inbound_links=0) 6. [Results] Identify high-authority pages (PageRank > threshold) 7. [AI Artifacts] Toggle "Generate Link Recommendations" 8. [Link Recs] Review recommendations → Note from_url, to_url, suggested_anchor, reason 9. [Export] Export to CSV → Import to CMS or link management tool 10. [Validation] Re-run crawl after implementing links → Verify PageRank improvements Touchpoints: Dashboard, Links Tab, Progress View, Results, AI Artifacts, Export Pain Points: Large graphs slow to visualize, manual link implementation Success Criteria: Orphans identified, recommendations actionable, PageRank improved after changes 
+Appendix D: Error Codes Reference
+Crawl Errors:
+• ERR_CRAWL_TIMEOUT: Crawl exceeded time limit. Reduce budget or check network connectivity.
+• ERR_CRAWL_ROBOTS: Robots.txt disallows crawling this path. Respect robots.txt or adjust configuration.
+• ERR_CRAWL_DNS: DNS resolution failed. Check domain name or network settings.
+• ERR_CRAWL_SSL: SSL certificate validation failed. Domain may have expired certificate.
+• ERR_CRAWL_REDIRECT_LOOP: Redirect chain detected (>5 hops). Check server configuration.
+AI Errors:
+• ERR_AI_BUDGET: AI budget cap reached ($50 default). Increase budget (PIN required) or disable AI features.
+• ERR_AI_SCHEMA: AI response failed JSON schema validation after 3 repair attempts. Partial artifact available.
+• ERR_AI_TIMEOUT: OpenRouter API call timed out (>60s). Check network or retry.
+• ERR_AI_CIRCUIT_OPEN: OpenRouter circuit breaker is open due to repeated failures. Wait 60s or retry manually.
+• ERR_AI_KEY_INVALID: OpenRouter API key is invalid or expired. Update key in settings (PIN required).
+Database Errors:
+• ERR_DB_BUSY: Database is locked by another process. Retry in a moment.
+• ERR_DB_CORRUPT: Database file is corrupted. Restore from backup.
+• ERR_DB_DISK_FULL: Insufficient disk space for database operation. Free up disk space.
+• ERR_DB_MIGRATION_FAIL: Schema migration failed. Check logs and rollback if needed.
+System Errors:
+• ERR_DISK_LOW: Low disk space ({X} GB remaining). Free up {Y} GB to continue.
+• ERR_MEM_HIGH: System memory usage >90% for 60 seconds. Crawl paused to prevent instability.
+• ERR_CPU_HIGH: CPU usage >85% for 60 seconds. Concurrency reduced automatically.
+• ERR_PIN_LOCKOUT: Too many PIN attempts (5/10min). Locked for 10 minutes. Contact admin if forgotten.
+• ERR_REQUEST_SIG_INVALID: Request signature validation failed. Session may have expired. Re-authenticate.
+Degradation States:
+• DEGRADED:AI - AI features unavailable due to budget exhaustion, API failure, or circuit breaker.
+• DEGRADED:DATA-SOURCES - External data sources (Wikipedia, pytrends) unavailable. Using cached data.
+• DEGRADED:NETWORK - Network connectivity lost. Running in offline mode with local data only.
+Appendix E: API Endpoint Specifications
+Authentication Header Requirements (All Endpoints):
+X-Nonce: {hex-encoded 32-byte nonce} X-Signature: {HMAC-SHA256(nonce || path || body)} X-Trace-Id: {UUID v4} 
+POST /crawl/run
+Request: { "project": "string (required, 1-100 chars)", "sitemap": "string (URL, optional, mutually exclusive with seeds)", "seeds": ["string (URL)"] (optional, mutually exclusive with sitemap), "budget": 5000 (integer, optional, default 5000, max configurable), "respect_robots": true (boolean, optional, default true) } Response (202 Accepted): { "job_id": "uuid", "status": "PENDING", "trace_id": "uuid" } Response (400 Bad Request): { "error": "ERR_CRAWL_INVALID_INPUT", "message": "Must provide either sitemap or seeds, not both", "trace_id": "uuid" } 
+POST /audit/run
+Request: { "project": "string (required)", "use_crux": false (boolean, optional, default false), "use_psi": false (boolean, optional, default false) } Response (202 Accepted): { "job_id": "uuid", "status": "PENDING", "estimated_duration_seconds": 300, "trace_id": "uuid" } 
+POST /topics/run
+Request: { "project": "string (required)", "seeds": ["term1", "term2"] (required, 1-50 terms), "use_pytrends": false (boolean, optional, default false, PIN required if true), "use_wiki": true (boolean, optional, default true) } Response (202 Accepted): { "job_id": "uuid", "status": "PENDING", "trace_id": "uuid" } 
+POST /links/run
+Request: { "project": "string (required)", "use_commoncrawl": false (boolean, optional, default false, PIN required if true) } Response (202 Accepted): { "job_id": "uuid", "status": "PENDING", "trace_id": "uuid" } 
+POST /ai/audit-plan
+Request: { "project": "string (required)", "bypass_cache": false (boolean, optional, default false) } Response (200 OK): { "artifact": {ActionPlan JSON schema}, "cached": true, "tokens_in": 1234, "tokens_out": 567, "cost_usd": 0.0123, "trace_id": "uuid" } Response (503 Service Unavailable): { "error": "ERR_AI_CIRCUIT_OPEN", "message": "OpenRouter circuit breaker is open. Retry in 60 seconds.", "trace_id": "uuid" } 
+POST /ai/cluster-labels
+Request: { "project": "string (required)", "bypass_cache": false } Response (200 OK): { "artifact": [ClusterLabel JSON schema array], "cached": false, "tokens_in": 890, "tokens_out": 456, "cost_usd": 0.0089, "trace_id": "uuid" } 
+POST /ai/internal-links
+Request: { "project": "string (required)", "max_recommendations": 10 (integer, optional, default 10) } Response (200 OK): { "artifact": [InternalLinkRec JSON schema array], "cached": true, "tokens_in": 1100, "tokens_out": 234, "cost_usd": 0.0067, "trace_id": "uuid" } 
+GET /jobs/{job_id}
+Response (200 OK): { "job_id": "uuid", "type": "crawl|audit|topics|links|ai", "status": "PENDING|STARTING|RUNNING|PAUSED|SUCCEEDED|FAILED|CANCELLED|FAILED_RECOVERABLE", "progress": { "current": 1234, "total": 5000, "percent": 24.68 }, "started_at": "2025-10-16T12:34:56Z", "updated_at": "2025-10-16T12:35:42Z", "estimated_completion": "2025-10-16T13:04:56Z", "trace_id": "uuid" } 
+POST /backup/now
+Request: { "pin": "string (required, 6-12 digits)" } Response (202 Accepted): { "job_id": "uuid", "message": "Backup initiated. Check logs for progress.", "trace_id": "uuid" } Response (401 Unauthorized): { "error": "ERR_PIN_INVALID", "message": "Invalid PIN. 4 attempts remaining before lockout.", "trace_id": "uuid" } 
+Appendix F: Test Case Summary
+Unit Tests (50+ test cases):
+Auditor Module:
+• T-AUD-001: robots.txt allow/deny parsing
+• T-AUD-002: Canonical tag extraction and validation
+• T-AUD-003: Heading hierarchy extraction (H1-H6)
+• T-AUD-004: hreflang tag parsing (all formats)
+• T-AUD-005: Indexability determination (noindex, robots)
+• T-AUD-006: URL normalization (scheme, trailing slash, fragments)
+• T-AUD-007: Per-rule predicates (all 27 rules)
+• T-AUD-008: HTML extraction with malformed input
+• T-AUD-009: SPA heuristics (framework markers, text density)
+• T-AUD-010: Delta calculation (added, removed, changed, stable)
+Link Graph Module:
+• T-LNK-001: PageRank on small graph (10 nodes, convergence)
+• T-LNK-002: Host-graph threshold trigger (50k edges)
+AI Module:
+• T-AI-001: Schema validation (accept valid JSON)
+• T-AI-002: Schema rejection (reject invalid JSON)
+• T-AI-003: Repair attempts (≤3 with logging)
+• T-AI-004: Cache key generation (includes prompt hash)
+• T-AI-005: TTL expiry (7 days)
+• T-AI-006: Budget enforcement (hard stop at cap)
+• T-AI-007: Partial artifact on failure (DEGRADED:AI annotation)
+Security Module:
+• T-SEC-001: argon2id PIN hashing (multiple test vectors)
+• T-SEC-002: CSP header enforcement
+• T-SEC-003: Keyring storage/retrieval
+• T-SEC-004: Email redaction (20+ patterns including plus-addressing)
+• T-SEC-005: International phone redaction (US, EU, APAC formats)
+• T-SEC-006: Token parameter redaction (URL params, case-insensitive)
+• T-SEC-007: PIN session timeout (30 minutes idle)
+• T-SEC-008: Request signing validation (nonce + HMAC)
+• T-SEC-009: PIN attempt rate limit (5/10min lockout)
+Observability Module:
+• T-OBS-001: Trace ID propagation through request chain
+• T-OBS-002: Metrics append to SQLite
+• T-OBS-003: Memory/CPU sampling (10s intervals)
+• T-OBS-004: SLO breach metric logging
+• T-OBS-005: Disk guard warning/halt triggers
+Integration Tests (10+ test cases):
+• T-AUD-INT-001: Crawl → Staging → DuckDB (batches, tx boundaries)
+• T-TOP-INT-002: Topics with mocked Wikipedia data (cluster stability)
+• T-LNK-INT-003: Link edges → PageRank (convergence flag)
+• T-DR-001: Backup execution (nightly + on-demand)
+• T-DR-002: Restore from backup (checksum validation)
+• T-DR-003: Manifest verification (row counts, integrity)
+• T-DR-004: Prune old backups (retention=5)
+• T-DR-005: Retention policy enforcement (90 days / 10 runs)
+• T-DR-006: Backup Now button functional
+• T-DB-MIG-001: Migration up (apply new schema)
+• T-DB-MIG-002: Migration down (rollback schema)
+• T-DB-MIG-003: Migration with rollback on failure
+End-to-End Tests (7+ test cases):
+• T-E2E-001: Full user journey (crawl button → artifacts display)
+• T-E2E-002: AI flow with mocked API (action plan generation)
+• T-E2E-003: Determinism (byte-compare after stable projection + timestamp nulling)
+• T-A11Y-001: Keyboard navigation (all interactive elements reachable)
+• T-A11Y-002: Color contrast validation (≥4.5:1 for text)
+• T-A11Y-003: ARIA attributes (roles, labels, live regions)
+• T-A11Y-004: Reduced motion support (animations disabled)
+Performance Tests (3 test cases):
+• T-PERF-CRAWL-5000: 5000 pages in ≤1800s (80/20 static/SPA, median of 3 runs)
+• T-PERF-PR-50K: 50k edges PageRank in ≤60s (convergence)
+• T-STRESS-WRITE-001: 16 workers concurrent writes (p95 ≤200ms queue wait)
+Chaos Tests (4+ scenarios):
+• CHAOS-AI-BREAKER: OpenRouter 429/500 → circuit breaker opens
+• CHAOS-NET: Network cut mid-crawl → offline mode, no crash
+• CHAOS-worker-kill: Kill worker → stale detection → retry
+• CHAOS-DB-lock: Lock DuckDB → retry/backoff → user prompt
+Coverage Target: ≥80% for core modules (enforced in CI)
+Appendix G: Milestone Deliverables
+M1 (Week 1) - Foundation:
+• [x] Environment setup (Python, Node, Tauri)
+• [x] Dependency matrix verification (§21 on Win11 + WSL)
+• [x] Hybrid crawl spike (HTTP + Playwright escalation)
+• [x] Performance baseline (T-PERF-CRAWL-5000 on both platforms)
+• [x] Logging/metrics infrastructure (JSONL, SQLite)
+• [x] Backup/restore implementation (nightly + on-demand)
+• [x] Staging queue + ingest writer (Option A)
+• [x] T-STRESS-WRITE-001 executed (SQLite-only benchmark)
+• [x] Decision: Option A or Option B based on p95 queue wait
+M2 (Week 2) - Security & Rules:
+• [x] Auditor rules (≥10 for v0.9, all 27 for v1.0)
+• [x] Circuit breakers (pybreaker per API)
+• [x] Sanitization (bleach backend, DOMPurify frontend)
+• [x] Unit/integration test stubs
+• [x] CSP verified (no console violations)
+• [x] PII redaction patterns (email, phone, tokens, homoglyphs)
+• [x] On-demand backup UI
+• [x] Request signing/nonce rotation (§6)
+• [x] PIN rate-limit enforcement (5/10min lockout)
+M3 (Week 3) - Links & Performance:
+• [x] Link graph extraction (internal edges)
+• [x] PageRank calculation (NetworkX)
+• [x] Performance validation (T-PERF-PR-50K)
+• [x] Host-graph fallback (>50k edges)
+• [x] CSV/JSON/Parquet exports
+M4 (Week 4) - Topics & i18n:
+• [x] Wikipedia pageviews integration
+• [x] MiniBatchKMeans clustering
+• [x] Content brief generation
+• [x] Golden data fixtures (10 pages: 5 static, 5 SPA)
+• [x] i18n key externalization (en-US.json)
+• [x] Wireframes finalization (Appendix C)
+M5 (Week 5) - AI & Release:
+• [x] OpenRouter integration (all 3 artifacts)
+• [x] AI budget caps and TTL/retry logic
+• [x] Code signing plan (or SHA-256 interim)
+• [x] E2E tests (T-E2E-001 to T-E2E-003)
+• [x] Chaos/performance test execution
+• [x] Release packaging (MSI installer)
+MVS Delivery (≤2 weeks):
+• HTTP-only crawl (50-100 pages)
+• Write url_doc to DuckDB
+• 2-3 audit rules functional
+• Tauri table view
+• CSV export
+• (Stretch goal met if 100 pages + 3 rules)
+Appendix H: Glossary
+• A11y: Accessibility (WCAG 2.2 AA compliance)
+• AC: Acceptance Criteria
+• API: Application Programming Interface
+• ARIA: Accessible Rich Internet Applications (attributes for screen readers)
+• Breaker: Circuit Breaker (fault tolerance pattern)
+• CC: Common Crawl (external backlink data source)
+• CLS: Cumulative Layout Shift (Core Web Vital)
+• CSP: Content Security Policy (XSS prevention)
+• CrUX: Chrome User Experience Report (real-user metrics)
+• E2E: End-to-End (testing)
+• FRD: Functional Requirements Document
+• HHI: Herfindahl-Hirschman Index (diversity metric)
+• HMAC: Hash-based Message Authentication Code
+• INP: Interaction to Next Paint (Core Web Vital)
+• IPC: Inter-Process Communication
+• JS: JavaScript
+• LCP: Largest Contentful Paint (Core Web Vital)
+• LRU: Least Recently Used (cache eviction)
+• MVS: Minimum Viable Slice (scoped initial delivery)
+• NFR: Non-Functional Requirement
+• PageRank: Link analysis algorithm (authority scoring)
+• PII: Personally Identifiable Information
+• PIN: Personal Identification Number (authentication)
+• PRD: Product Requirements Document
+• PSI: PageSpeed Insights (Google performance API)
+• SBOM: Software Bill of Materials (dependency manifest)
+• SEO: Search Engine Optimization
+• SLO: Service Level Objective (performance target)
+• SPA: Single Page Application (JavaScript-rendered)
+• TTL: Time To Live (cache expiration)
+• UI: User Interface
+• UUID: Universally Unique Identifier
+• WCAG: Web Content Accessibility Guidelines
+• WSL: Windows Subsystem for Linux
+10. Sign-Off and Approval
+10.1 Document Review
+This FRD has been derived from PRD v1.1.6 and represents a complete translation of product requirements into detailed functional specifications.
+Review Checklist:
+• [x] All PRD requirements mapped to FRD functional requirements
+• [x] Traceability matrix complete (Requirement → Design → Tests)
+• [x] Acceptance criteria defined for all MUST requirements
+• [x] API specifications documented with request/response examples
+• [x] Error codes cataloged with user messages and remediation
+• [x] User journeys mapped to functional requirements
+• [x] Test coverage planned (≥80% core modules)
+• [x] Security requirements detailed (PIN, PII, request signing, CSP)
+• [x] Performance targets quantified with measurement methodology
+• [x] Deployment requirements specified (MSI, WSL compatibility)
+10.2 Approval Signatures
+Product Owner: Jack
+Date: October 16, 2025
+Signature: _________________________
+Development Lead: Jack
+Date: October 16, 2025
+Signature: _________________________
+QA Lead: [To be assigned]
+Date: _________________________
+Signature: _________________________
+10.3 Change Control
+Version History:
+VersionDateAuthorChanges1.0.02025-10-16JackInitial FRD based on PRD v1.1.6 
+Change Request Process:
+• Submit change request via project tracking system
+• Impact analysis (scope, timeline, resources)
+• Stakeholder review and approval
+• Update FRD with version increment
+• Communicate changes to all stakeholders
+• Update traceability matrix and test plans
+11. Next Steps
+11.1 Immediate Actions (Week 1)
+• Dependency Verification: Execute AC-DEP1 verification matrix on Win11 native and WSL
+• Performance Baseline: Run T-PERF-CRAWL-5000 and T-STRESS-WRITE-001 to establish baseline
+• Option A/B Decision: Based on T-STRESS-WRITE-001 results, finalize write strategy
+• Development Environment: Set up all developers with verified dependency lockfile
+• Test Infrastructure: Initialize pytest framework with coverage reporting
+11.2 Development Sequence
+• Core Crawl Engine: Implement hybrid crawl (FR-AUD-002) with HTTP-first + Playwright escalation
+• Audit Framework: Build rule framework and implement initial 10 rules (FR-AUD-003)
+• Security Layer: Implement request signing, PIN authentication, PII redaction (FR-SEC-001 to FR-SEC-003)
+• Data Pipeline: Complete staging → DuckDB ingest writer with transaction boundaries
+• Observability: Structured logging, metrics collection, dashboards (FR-OBS-001 to FR-OBS-003)
+• AI Integration: OpenRouter integration with budget controls and schema validation (FR-AI-001 to FR-AI-007)
+• UI Components: Tauri dashboard, run panel, results tables, AI artifacts view
+• Testing: Execute all unit, integration, E2E, performance, and chaos tests
+• Documentation: Complete user guide, API reference, runbooks
+• Packaging: Build MSI installer with first-run wizard
+11.3 Success Criteria for v1.0 Release
+• All MUST requirements implemented and tested
+• Test coverage ≥80% for core modules
+• T-PERF-CRAWL-5000 passes (≤1800s for 5000 pages on Win11)
+• All security controls verified (PIN, request signing, PII redaction, CSP)
+• Zero HIGH/CRITICAL CVEs in pip-audit
+• User documentation complete
+• MSI installer tested on clean Windows 11 installation
+• MVS delivered in ≤2 weeks (50-100 pages HTTP crawl, 2-3 rules, CSV export)
+END OF FUNCTIONAL REQUIREMENTS DOCUMENT
+This FRD is a living document and will be updated as requirements evolve. All changes must go through the formal change control process.

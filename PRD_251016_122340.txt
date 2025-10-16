@@ -1,0 +1,284 @@
+PRD v1.1.6 — Local-First SEO Auditor (“Ahrefs-lite”) with AI (OpenRouter)
+Target: Single-user, offline-first desktop app (Windows 11 / WSL-friendly) with opt-in external APIs
+Owner: Jack
+Date: 2025-10-16 (America/Detroit)
+0) Scope, Traceability & Documents
+• In-scope: Local SEO suite (crawl/audit, topic explorer, internal link graph) + AI reasoning via OpenRouter (flag-gated).
+• Out-of-scope: Any agent/embeddings/Pinecone materials (Blueprint_v1_4.md, offline_drill.py, cost_validate.py, backup_export.py, test_data_fixtures.py, log_schema.json).
+• Traceability rule (enforced): Every requirement (§3, §4) maps to (a) Appendix A design paragraphs and (b) ≥1 test case in Appendix B.
+• Coverage Matrix: §27 lists requirement → design → tests mappings.
+1) Problem, Goals, Success Metrics & Why-Now
+1.1 Problem
+Cloud SEO tools are expensive and centralize sensitive content. Need a private, local toolkit to crawl/audit, explore topics, analyze internal link graph, and use LLM reasoning—without mandatory cloud usage.
+1.2 Goals (MoSCoW)
+• Must: Hybrid crawl; audits with diffs; internal link graph + PageRank; AI artifacts (action plan, cluster labels, internal link recs) with strict JSON schemas; offline-usable.
+• Should: Topic explorer (Wikipedia; pytrends opt-in), backup/restore, circuit breakers, AI budget caps, baseline accessibility (WCAG 2.2 AA), on-demand backup, i18n scaffolding.
+• Could: Bounded Common Crawl host edges (flag); wireframes pack; Windows code signing.
+• Won’t (v1): SERP scraping; multi-tenant/server; global backlink parity.
+1.3 Success Metrics (with measurement methodology)
+• Crawl throughput: 5,000 pages ≤ 30 min on Win11 if ≥80% pages are static.
+Method: Fixed corpus (100 domains; 80/20 static/SPA), HTTP concurrency 16, Playwright tabs ≤2; measure wall-clock, CPU/RAM, disk; repeat 3×; median reported.
+• Audit coverage: ≥25 rules with evidence + AC per rule; pass/fail rate reported per run.
+• Reproducible facts: Given identical inputs, facts tables are byte-identical after stable projection (schema-defined column order) and timestamp nulling.
+• Privacy: With all toggles off, 0 external calls (validated by logs).
+• Accessibility: Keyboard-navigable core flows; contrast ≥4.5:1; no keyboard traps.
+1.4 Why-Now
+Local analytics stacks (DuckDB, Tauri) are mature; privacy expectations rising; API costs controllable with strict caps; incumbents remain cloud-first.
+2) Personas & Journeys
+• Owner-Operator: Audit own site; apply prioritized fixes.
+• Strategist: Cluster topics, label intents, generate briefs.
+• Engineer: Analyze internal link flow; add targeted links.
+Journeys:
+J1: Project → Crawl (Hybrid) → Audit → AI Action Plan → Export MD
+J2: Topic seeds → Wikipedia trends → Cluster & Label (AI) → Export briefs
+J3: Crawl → Link Graph → PageRank → AI internal link recs → Apply
+3) Functional Requirements
+3.1 Auditor — MUST
+• Input: Sitemap or URL list; robots-aware; per-host token bucket (0.5 rps, burst 1).
+• Hybrid crawl: HTTP-first (httpx/aiohttp), escalate to Playwright on SPA/JS heuristics (framework markers, low text density, prior JS flag). Cache JS requirement; retries 1s/3s/7s (≤3).
+• Parse/Compute: titles/meta, headings, canonicals, hreflang, indexability, internal links; optional lab metrics via Playwright traces.
+• Rule framework & selection criteria:
+• Rule template: {id,name,category,impact_model,severity_calc,evidence_extractor,auto_fixable,acceptance_criteria}.
+• Selection prioritization: (1) Indexability & canonical correctness, (2) Click driver (titles/meta HHI), (3) Render blockers (JS/noindex), (4) UX Core (LCP/INP/CLS), (5) International (hreflang), (6) Link flow (orphans/depth).
+• Initial rule set (≥26):
+• Missing <title>; 2. Duplicate <title>; 3. Title length bounds; 4. Meta description missing; 5. Meta description length bounds; 6. Multiple canonicals; 7. Canonical to non-200; 8. Canonical to non-indexable; 9. Noindex tag; 10. Robots disallow vs crawled; 11. 3xx chains >1; 12. 4xx/5xx frequency; 13. H1 missing; 14. Multiple H1; 15. H1 length bounds; 16. Thin content (word_count < X); 17. Large HTML (>2MB); 18. Mixed content; 19. Orphan pages; 20. Click depth > N; 21. Broken internal links; 22. Canonicalized but linked; 23. hreflang missing/invalid; 24. hreflang to non-canonical; 25. LCP > 2.5s (lab); 26. CLS > 0.25 (lab); 27. INP > 200ms (lab).
+• Delta: Compare to previous run by url+rule_id; show added/removed/changed.
+3.2 Topic Explorer — SHOULD
+• Inputs: seed terms; sources: Wikipedia Pageviews (default), pytrends (flag).
+• Features: normalize signals; MiniBatchKMeans clustering; extract questions; brief generator.
+• Outputs: clusters with seasonality; exportable briefs.
+3.3 Link Graph — MUST
+• Internal edges from crawl; Page/Host PageRank (tol 1e-6, max_iter 100).
+• Common Crawl (flag OFF by default) — COULD: ≤200MB one WAT; parse Links; filter to in-scope hosts; stop at 1M rows or 5 min; delete WAT; refuse if free disk <5GB.
+3.4 AI Reasoning (OpenRouter) — MUST
+• Artifacts: Action Plan, Cluster Labels/Briefs, Internal Link Recs.
+• Contracts: strict JSON schemas (§8), Pydantic extra='forbid'; ≤3 repair attempts, then DEGRADED:AI with partials; cache (model_id,version,prompt,facts_hash); TTL 7 days.
+3.5 UX, Accessibility & i18n — MUST
+• Tauri desktop: Projects→Sites; actions: Crawl, Audit, Topics, Links, Generate with AI, Backup Now.
+• Degradation/budget banners; toasts with error codes; retry affordances.
+• Accessibility: keyboard, ARIA, visible focus, reduce motion.
+• i18n: All user-facing strings externalized in i18n/*.json; default en-US; locale switcher (tech preview).
+• Error catalog: Standardized error codes (ERR_CRAWL_TIMEOUT, ERR_AI_BUDGET, ERR_DB_BUSY, ERR_DISK_LOW, ERR_PIN_LOCKOUT), user message, remediation snippet.
+• Wireframes (Appendix C): Projects list; Run panel; Results tables; AI artifacts view; Logs viewer.
+4) Non-Functional Requirements
+• Privacy: No data leaves device unless toggled.
+• Determinism: Facts reproducible (stable projection + timestamp nulling).
+• Performance: §7 guardrails + perf/stress tests.
+• Portability: Windows 11 + WSL (documented).
+• Security: §12 (localhost, request signing, keyring, CSP, PIN gate).
+• Operability: Backups, circuit breakers, degradation.
+• Retention: Keep last 10 runs or 90 days of facts (configurable).
+5) System Architecture
+• UI: Tauri 2.x (Rust shell + React).
+• API: FastAPI on 127.0.0.1:8787.
+• Workers: Python async processes per domain (crawl/audit/topics/links/ai).
+• Storage: DuckDB (facts); SQLite (jobs/ai_cache/metrics/staging); Parquet exports.
+• External (opt-in): PSI/CrUX, Wikimedia, pytrends, Open PageRank, Common Crawl.
+(Details & diagrams in Appendix A; textual ER in §13.)
+6) IPC, Jobs, Transactions & Concurrency
+• IPC security: Localhost HTTP + request signing. Backend issues per-session 32-byte random nonce and HMAC key (stored in OS keyring).
+• Client (Tauri) sends X-Nonce, X-Signature=HMAC_SHA256(nonce || path || body) and X-Trace-Id for each request.
+• Nonce rotates every 30 min or on PIN re-auth; 401 on missing/invalid signature.
+• Jobs (SQLite): PENDING→STARTING→RUNNING→(PAUSED)→SUCCEEDED|FAILED|CANCELLED|FAILED_RECOVERABLE; heartbeat 15s; stale RUNNING >60m → recoverable.
+• Transactional boundaries:
+• Staging write (SQLite): each batch insert in duck_ingest_queue is a transaction (≤500 rows).
+• Ingest commit (DuckDB): single-writer consumes batches → BEGIN; INSERT ...; COMMIT per batch; on failure ROLLBACK & re-queue with attempts+1.
+• Cross-DB atomicity: “at-least-once” into DuckDB; idempotent upserts keyed by (run_id,url or primary key).
+• Writes (Windows-friendly):
+Option A (default): Workers → SQLite staging; Ingest Writer drains to DuckDB (100–500 row batches).
+Option B (fallback): Single process writes directly to DuckDB; workers send over IPC channel.
+• Decision criteria & justification:
+• Target: p95 staging wait ≤200ms keeps end-to-end ingest hidden under per-page parse times (100–400ms), avoiding user-visible lag.
+• Fail: p95 >500ms or >2% WAL errors indicates lock contention that risks perf/SLO violations → switch to Option B.
+• Authority: Determined by T-STRESS-WRITE-001 on Win11 native & WSL.
+7) Performance Guardrails & Limits
+• Target (AC-P1): 5,000 pages ≤ 1,800s on Win11 if ≥80% static.
+HTTP concurrency ≤16; Playwright tabs ≤2; recycle every 100 pages; watchdog kills orphans; GPU off.
+• If JS pages >20%: prompt to reduce budget to 2,000 or run per-host batches.
+• Budgets: default 5,000 pages/run; max configurable.
+• Disk guard: warn 15GB, hard stop 20GB (configurable).
+• Memory: App RSS target ≤4GB; Playwright per-browser ≤1.5GB (recycle); halt if >90% RAM for 60s (prompt).
+• CPU: reduce HTTP concurrency if CPU >85% for 60s.
+• PageRank: tol 1e-6, max_iter 100; switch to host-graph if >50k edges.
+8) AI Output Contracts & Prompting
+8.1 Action Plan (JSON)
+{ "project":"string","summary":"string","quick_wins":["string"], "fixes":[{"id":"string","issue":"string","impact":"high|med|low","effort":"high|med|low", "recommended_change":"string","steps":["string"], "evidence":[{"url":"https://...","field":"lcp_ms|title|meta_desc|...","value":{},"rationale":"string"}], "acceptance_criteria":["string"]}]} 
+8.2 Cluster Labels (JSON)
+[{"cluster_id":0,"name":"string","search_intent":"informational|commercial|transactional|navigational", "representative_terms":["string"],"seasonality_note":"string","content_brief_md":"string"}] 
+8.3 Internal Link Recs (JSON)
+[{"from_url":"https://...","to_url":"https://...","suggested_anchor":"string","reason":"string"}] 
+8.4 Prompt templates (versioned)
+• Stored in prompts/v1/{action_plan,cluster_labels,internal_links}.txt.
+• Each includes: purpose, schema echo, constraints (no HTML/tables), temperature ≤0.3, max_tokens, forbid extra fields instruction.
+• Cache key includes prompt_version_hash (§15).
+Validation: Pydantic extra='forbid'; ≤3 repairs; on failure → DEGRADED:AI + partials annotated.
+9) Observability & SLO Automation
+• Logs (JSONL): ts,level,trace_id,run_id,job_id,stage,event,url,latency_ms,err_code,err_msg,meta{}.
+• Metrics: CSV + SQLite rolling 24h (crawl_pages_total,crawl_errors_total,crawl_rps,ai_tokens_in/out,ai_cost_usd,queue_depth,disk_used_bytes,pagerank_iter,pagerank_converged,mem_rss_mb,cpu_pct,slo_breach).
+• Dashboard: lightweight HTML at /metrics/ui and /logs/ui with filter/search/export.
+• Tracing: trace_id propagated and sent as X-Trace-Id.
+• SLO measurement automation: Background task computes SLO attainment hourly; error-budget burn at 50% → banner + /logs/ui highlight; 100% → force degrade mode & pause non-essential tasks.
+10) Backups, DR, Atomicity & Retention
+• Schedule: Nightly 02:00 America/Detroit (or user-local if configured). On-Demand “Backup Now” button runs same pipeline.
+• Artifacts: DuckDB → backups/duckdb/YYYY-MM-DD.duckdb; SQLite → backups/sqlite/YYYY-MM-DD.db; Parquet exports.
+• Retention: keep 5 most recent per store (BACKUPS_KEEP=5); prune older.
+• Restore: scripts/restore.ps1 --date YYYY-MM-DD; checksum + integrity query; resume.
+• Manifest: row-count checksums per table; verified post-restore.
+11) Degradation & Circuit Breakers
+• Breakers: pybreaker per API — open on 5 errors/60s, half-open after 60s.
+• Modes: DEGRADED:AI, DEGRADED:DATA-SOURCES, DEGRADED:NETWORK (UI banner + annotation).
+• Limits: per-host 0.5 rps; per-API aiolimiter (e.g., Wikimedia ≤10/s); global HTTP ≤8 (adaptive to CPU/mem).
+12) Security, Privacy & Supply Chain
+• Secrets: Windows Credential Manager via keyring; .env.local stores names only.
+• Request signing (localhost auth): §6 (nonce+HMAC) required for all API calls.
+• Sanitization: Backend bleach; UI DOMPurify; CSP:
+default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self' http://127.0.0.1:8787; frame-ancestors 'none'; base-uri 'none'; object-src 'none'; 
+• Binding & Auth: API 127.0.0.1; PIN mandatory for critical actions (argon2id m=64MB,t=3,p=1, 16-byte salt).
+Critical actions (PIN-gated): Delete Project, Delete All Data, Export All, Change API Keys, Restore Backup, Increase AI budget >$10, Toggle Common Crawl.
+Session: 30-min idle timeout → prompt PIN; rate-limit PIN attempts 5/10min, then 10-min lockout.
+• PII Redaction (pre-AI & logs):
+• Emails: RFC 5322 patterns (incl. subdomains & plus-addressing).
+• Phones: E.164 and common intl formats (US/CA, EU, APAC; optional spaces/dashes/parentheses).
+• Tokens in URLs/params: api_key|apikey|token|auth|bearer|sid|session|key|access_token (?name=value and &name=value, case-insensitive).
+• Secrets in headers: Authorization, X-API-Key.
+• Unicode homoglyph safety: canonicalize before match; redact to [REDACTED].
+• Supply chain: pip-tools/pip-compile with --generate-hashes lockfile; pip install --require-hashes; SBOM (CycloneDX JSON); pip-audit CI; quarterly updates.
+• Threat model: STRIDE snapshot + quarterly review cadence documented in runbooks.
+• Code signing: Target Windows cert by M5; until then, show MSI SHA-256 in UI.
+13) Data Model (DuckDB/SQLite)
+• url_doc(url,domain,first_seen,last_crawled,status,robots_ok,canonical,title,meta_desc,word_count,outbound_links,inbound_links)
+• audit_run(run_id,app,started_at,finished_at,target,mode)
+• audit_metric(run_id,url,lcp_ms,inp_ms,cls,perf,seo,a11y,bp,issues_json)
+• topic_term(term,source,ts,score,kind,parent,cluster)
+• link_edge(src,dst,src_host,dst_host,first_seen,last_seen)
+• host_rank(host,pr,degree,updated_at)
+• jobs(id,type,payload_json,state,trace_id,attempts,last_error,created_at,updated_at) (SQLite)
+• duck_ingest_queue(id,table,payload_json,created_at) (SQLite staging)
+• ai_cache(key,ts,model,req_json,res_json) (SQLite)
+• metrics(ts,name,value,labels_json) (SQLite)
+• ER (textual):
+• url_doc 1-N audit_metric (by run_id,url)
+• url_doc → link_edge → host_rank
+• jobs orchestrates runs producing audit_run & facts; duck_ingest_queue buffers to DuckDB
+• ai_cache keyed by (model,version,prompt_hash,facts_hash)
+• Retention: prune runs >90 days or keep latest 10 (configurable).
+14) API Endpoints (FastAPI)
+• POST /crawl/run {project, sitemap|seeds, budget, respect_robots}
+• POST /audit/run {project, use_crux, use_psi}
+• POST /topics/run {project, seeds, use_pytrends, use_wiki}
+• POST /links/run {project, use_commoncrawl}
+• POST /ai/audit-plan {project} → ActionPlan JSON
+• POST /ai/cluster-labels {project} → ClusterLabel[]
+• POST /ai/internal-links {project} → InternalLinkRec[]
+Hardening: Max body 5MB; JSON only; Pydantic extra='forbid'; headers X-Trace-Id, X-Nonce, X-Signature; 403 on missing/invalid signature.
+15) Cache & Drift
+Key: sha256(model_id|version|prompt_version_hash|facts_hash); TTL 7 days; LRU >200MB; “Regenerate” bypass logs reason.
+16) SLOs, Error Budgets, Migrations, Rollback
+• SLOs: Crawl success ≥95% p7d; AI p95 ≤30s; UI p95 ≤200ms; Queue p95 ≤10s.
+• Automation: Hourly SLO evaluation task; burn tracked; banners at 50%/100%.
+• Migrations: _schema_version; idempotent up/down SQL (e.g., 001_add_lcp_column.sql); dry-run; rollback applied if checks fail.
+• Release: SemVer; keep last two bundles; minor updates backward-compatible.
+17) Test Strategy (overview; details in Appendix B)
+• Unit: robots, extraction, rules, PR math, schemas, PIN vectors, PII redaction (20+ vectors incl. homoglyphs).
+• Integration: crawl→staging→DuckDB via ingest writer; topics (mocked sources); links PR; AI cache hit.
+• E2E: button→artifact; determinism (byte-compare after stable projection & ts nulling); CSP console clean.
+• Performance: crawl 5k (80/20) ≤1800s; PR 50k edges ≤60s; mem/CPU ceilings enforced.
+• Stress: T-STRESS-WRITE-001 16 workers; p95 staging wait target ≤200ms (fail >500ms).
+• Chaos: OpenRouter 429/500; network cut; worker kill; DuckDB lock.
+Runner: scripts/chaos_runner.py orchestrates scenarios with seeds, timings, assertions; outputs JUnit XML.
+• Coverage: ≥80% core modules; perf regression gate at >10% p95 delta.
+• Golden fixtures: tests/fixtures/golden_10_pages/ (5 static, 5 SPA) with expected url_doc.jsonl, audit_metric.jsonl, link edges; used in E2E determinism.
+18) Runbooks (implemented)
+Playwright won’t start; OpenRouter 429/500; DuckDB corrupted; Disk full; Migration rollback; High contention → switch to Option B; Ingest writer crash/leak (restart & queue backpressure); PIN lockout; Request-signature failures.
+19) Windows & WSL
+Use pathlib.Path; POSIX paths in DB; prefer WSL FS for hot data; installer runs playwright install --with-deps. Baseline perf measured on both; if WSL is ≥20% faster, installer recommends WSL.
+20) Cost Model & Controls (OpenRouter & Other APIs)
+• OpenRouter: Hard cap MAX_BUDGET_USD (default $50), warn $40; pre-call token estimate (±10% goal); AI parallelism ≤2; log ai_tokens_in/out & ai_cost_usd.
+Per-artifact estimate: max_tokens_out * $/1k_tok_out + tokens_in * $/1k_tok_in; shown before run if AI enabled.
+• Other APIs (opt-in): Wikimedia/pytrends free (rate-limited); PSI/CrUX (if used) show estimated quota consumption; all off by default.
+21) Dependency Matrix & Verification Status
+Status: UNVERIFIED until M1 Week 1 matrix install completes on Win11 native & WSL. Lockfile strategy defined; no compatibility claims until verified.
+LayerPackageTarget VersionPythonUITauri2.x—APIFastAPI^0.1153.11Storageduckdb^1.4.1≥3.9Crawlplaywright^1.483.9–3.12Parsetrafilatura2.0.0≥3.8Parseselectolax0.4.0≥3.8Graphnetworkx3.53.11–3.13MLscikit-learn1.6.*3.9–3.13Trendspytrends4.9.1≥3.8HTTPhttpx^0.27≥3.8Rate-limitaiolimiter^1.1≥3.8Breakerspybreaker^1.0≥3.8 
+Verification plan (AC-DEP1): CI job installs pinned set on Win11 & WSL; generates SBOM; runs smoke tests (crawl 10 pages; PR small graph); pip-audit must show 0 HIGH/CRITICAL; commit lockfile with hashes.
+22) Milestones, MVS & Scope Clarification
+• Committed delivery target: MVS (≤2 weeks)
+HTTP-only crawl 50 pages, write url_doc, 2 audit rules, Tauri table view, CSV export. (Stretch: 100 pages + 3 rules.)
+• v1.0 (post-MVS, contingent on resourcing): Auditor (≥25 rules), Hybrid crawl, Links+PR, Topics (Wikipedia), AI artifacts, backups, breakers, SLOs, PIN gates, CSP, PII redaction.
+Resourcing & decision gates
+• If solo, remain MVS until P0.1–P0.3 pass and Option A/B decided (§24); do not enable CC/pytrends/AI before perf baseline.
+• Contractor (0.25 FTE Weeks 2–5) focuses on Playwright/Windows perf & packaging.
+Milestones & durations
+• M1 (Week 1): Env; matrix dependency verification (§21); hybrid crawl spike; perf baseline; logs/metrics; backup/restore; staging queue + ingest writer; T-STRESS-WRITE-001 & SQLite-only benchmark. (5 days)
+• M2 (Week 2): Auditor rules (≥10 for v0.9); breakers; sanitization; unit/integ stubs; CSP verified; PII patterns expanded; on-demand backup; request signing/nonce; PIN rate-limit. (5 days)
+• M3 (Week 3): Link Graph + PageRank; PR perf; host-graph fallback; exports. (5 days)
+• M4 (Week 4): Topics (Wikipedia); clustering; briefs; golden data; i18n keys/wireframes. (5 days)
+• M5 (Week 5): AI flows + caps/TTL/retries; code signing plan; E2E + chaos/perf runs; release prep. (5 days)
+• Buffer: Allocate 2 days after M1 for Option B pivot if needed.
+23) Acceptance Criteria
+• AC-O1 (Observability): JSON logs with trace_id; dashboards /metrics/ui & /logs/ui; SLO automation & budget banners.
+• AC-R1 (Backups/DR): Nightly 02:00 America/Detroit + Backup Now; restore verified; retention ≥5.
+• AC-D1 (Degradation): Usable with externals off; accurate banners.
+• AC-S1 (Security): Keyring; sanitized HTML + CSP; localhost bind; request signing; PIN mandatory + 30-min timeout + rate-limit.
+• AC-C1 (Cost): Budget cap enforced; invalid-JSON AI retries ≤3 then graceful fail.
+• AC-T1 (Testing): Unit/integration/E2E pass; golden data; determinism byte-compare; coverage ≥80%.
+• AC-P1 (Performance): 5k pages ≤30 min (≥80% static) or budget prompt to 2k; PR converges/warns; disk/mem/CPU guards enforced.
+• AC-SCM1 (Supply chain): SBOM; pip-audit no HIGH/CRITICAL CVEs; lockfile with hashes.
+• AC-DEP1 (Deps): §21 verified on Win11 & WSL.
+24) Risks & Decision Rules (Top)
+• Unverified dependencies (Critical): Block build until §21 matrix passes; if fails, downgrade/patch; lockfile committed.
+• Windows write contention (Critical): If T-STRESS-WRITE-001 p95 wait >500ms or WAL errors >2% → switch to Option B and re-baseline perf; update §6/§7 and timeline.
+• Solo delivery (Major): If contractor not secured by end of M1, continue MVS plan; v1.0 slips.
+• Playwright flakiness (Major): Recycling + watchdog + GPU off; if >30% failures → prompt HTTP-only / reduce JS escalation.
+• Performance infeasibility (Major): If extrapolation shows 5k >1800s, tighten SPA threshold to 90% static or extend target to 45 min (update §1.3, §7, §26).
+25) Packaging & Install
+Tauri MSI; first-run wizard: keyring setup, firewall rule, playwright install --with-deps.
+Dirs: logs/, metrics/, backups/, artifacts/, storage/, data/.
+Unsigned install shows SHA-256 with verification steps.
+26) JSON Sidecar
+{ "version": "1.1.6", "delivery_target": "MVS (≤2 weeks)", "slo": {"crawl_success_p7d": 0.95, "ai_p95_s": 30, "ui_p95_ms": 200, "queue_p95_s": 10}, "budgets": {"max_pages_per_run": 5000, "disk_warn_gb": 15, "disk_stop_gb": 20, "ram_app_gb": 4, "ram_pw_gb": 1.5, "openrouter_cap_usd": 50, "openrouter_warn_usd": 40}, "security": {"bind": "127.0.0.1", "request_signing": "nonce+hmac", "keyring": true, "sanitize_html": true, "pii_redaction": "Email+IntlPhone+Tokens+Homoglyph", "pin": "argon2id(m=64MB,t=3,p=1)", "pin_idle_timeout_min": 30, "pin_rate_limit": "5/10min"}, "degradation": ["DEGRADED:AI","DEGRADED:DATA-SOURCES","DEGRADED:NETWORK"], "testing": {"suites":["unit","integration","e2e","chaos","perf","stress"], "golden_data": true, "determinism": "stable_projection+ts_null", "coverage_target": 0.8, "chaos_runner": true}, "crawl": {"mode":"hybrid","http_concurrency_max":16,"playwright_tabs_max":2,"target_5000_pages_secs":1800,"js_ratio_prompt_threshold":0.2}, "common_crawl": {"enabled_default": false,"wat_cap_mb": 200,"row_cap": 1000000,"time_cap_seconds": 300}, "backups": {"time":"02:00 America/Detroit","on_demand": true,"retention_keep": 5}, "deps": {"verified": false, "lockfile_hashes": true, "pip_audit_required": true}, "cost": {"ai_budget_cap_usd": 50, "ai_budget_warn_usd": 40, "precall_estimate": true} } 
+27) Coverage Matrix (Requirement → Design → Tests)
+PRD Req (§)Design (§/Appendix)Tests (Appendix B IDs)§3.1 Auditor (Hybrid)§6, §7; A.4 Hybrid CrawlT-AUD-001..010, T-AUD-INT-001, T-PERF-CRAWL-5000, CHAOS-NET§3.1 Rule framework§3.1 (template & 26+ rules)T-AUD-007 per-rule predicates; golden fixtures§3.2 TopicsA.1 Components, A.7 ObservabilityT-TOP-001..006, T-TOP-INT-002§3.3 Links & PR§7; A.10 CapacityT-LNK-001..006, T-PERF-PR-50K§3.4 AI Contracts & prompts§8; §14; §15T-AI-001..007, CHAOS-AI-BREAKER§3.5 UX/A11y/i18n§3.5; A.5 UI; Appendix CT-E2E-001..003, T-A11Y-001..004§4 NFRs§7, §10, §12, §19T-SEC-001..009, T-OBS-001..005, T-PERF-CRAWL-5000, T-E2E-003Backups/Retention§10T-DR-001..006Degradation§11T-DGR-001..004Cost Controls§20T-AI-COST-001Migrations§16T-DB-MIG-001..003IPC Auth (Signing)§6, §12T-SEC-008Write Concurrency (A/B)§6, §7T-STRESS-WRITE-001SLO Automation§9, §16T-OBS-004 (slo_breach), dashboard checks 
+28) Team, Skills & Ownership
+• Owner: Jack (Full-stack; Python async; DuckDB; React; Tauri).
+• Contractor (optional, 0.25 FTE Weeks 2–5): Playwright/Windows perf & packaging.
+• Decision gate: If contractor not secured by end of M1, continue MVS track only; re-baseline v1.0 scope/timeline.
+Glossary
+SPA (JS-rendered); Breaker (circuit breaker); A11y (accessibility); MVS (minimum viable slice).
+Appendix A — Architecture (Summary)
+• Components: Tauri UI; FastAPI; Worker pool; DuckDB facts; SQLite ops+staging; Parquet exports.
+• Orchestration: SQLite jobs with heartbeats; staging queue → single ingest writer → DuckDB batched commits; Option B direct single-process writer.
+• Hybrid Crawl: HTTP-first; SPA heuristics; decision cache; retries; watchdog; GPU off.
+• Common Crawl: Flag-gated; ≤200MB WAT; ≤1M rows or 5 min; host aggregation; delete WAT.
+• Security: localhost; nonce+HMAC signing; argon2id PIN + 30-min idle + rate-limit; CSP; sanitization; keyring; SBOM + pip-audit.
+• Observability: JSONL logs; metrics CSV/SQLite; dashboard & logs UI; trace id propagation; mem/cpu sampling.
+Appendix B — Test Plan (IDs with brief specs)
+Unit
+• T-AUD-001 robots allow/deny; T-AUD-002 canonical; T-AUD-003 headings/meta; T-AUD-004 hreflang; T-AUD-005 indexability; T-AUD-006 URL normalize; T-AUD-007 per-rule predicates; T-AUD-008 HTML extraction; T-AUD-009 SPA heuristics; T-AUD-010 delta calc.
+• T-LNK-001 PR small graph; T-LNK-002 host-graph threshold.
+• T-AI-001 schema accept; T-AI-002 schema reject; T-AI-003 repair ≤3; T-AI-004 cache key (incl. prompt hash); T-AI-005 TTL expiry; T-AI-006 budget stop; T-AI-007 partial artifact on fail.
+• T-SEC-001 argon2id vectors; T-SEC-002 CSP header; T-SEC-003 keyring; T-SEC-004 email redaction; T-SEC-005 intl phones; T-SEC-006 token params; T-SEC-007 PIN session timeout; T-SEC-008 request signing (nonce/HMAC); T-SEC-009 PIN attempt rate-limit.
+• T-OBS-001 trace propagation; T-OBS-2 metrics append; T-OBS-003 mem/cpu sampling; T-OBS-004 slo_breach; T-OBS-005 disk guard.
+Integration
+• T-AUD-INT-001 crawl→staging→DuckDB; batches honored; tx boundaries.
+• T-TOP-INT-002 topics with mocked sources; clusters stable.
+• T-LNK-INT-003 edges→PR; convergence flag.
+• T-DR-001 backup; T-DR-002 restore; T-DR-003 manifest; T-DR-004 prune; T-DR-005 retention kept; T-DR-006 Backup Now works.
+• T-DB-MIG-001..003 migration up/down & rollback.
+E2E
+• T-E2E-001 Crawl button→artifacts; T-E2E-002 AI flow mocked; T-E2E-003 determinism (byte-compare after stable projection & ts nulling).
+• T-A11Y-001..004 keyboard/contrast/focus/reduce-motion.
+Performance & Stress
+• T-PERF-CRAWL-5000 (80/20 static/SPA) ≤1800s (median of 3 runs).
+• T-PERF-PR-50K ≤60s convergence.
+• T-STRESS-WRITE-001 16 workers→staging→DuckDB; p95 queue wait ≤200ms target; fail if >500ms (or >2% WAL errors) → Option B.
+Chaos (automated via scripts/chaos_runner.py)
+• CHAOS-AI-BREAKER OpenRouter 429/500 trips breaker; banner visible.
+• CHAOS-NET network cut mid-run; degrade to local; continue; no crash.
+• Kill crawl worker; stale RUNNING→recoverable; successful retry.
+• Lock DuckDB file; retry/backoff; user prompt with remediation.
+Appendix C — Wireframes (Text Summary)
+• Projects: list with last run status, disk usage, actions (Run, Backup Now, Export).
+• Run Panel: target inputs, budgets, toggles (AI/pytrends/CC), perf preview (token estimate, cost).
+• Results Tables: url_doc, audit_metric with rule filters, delta view.
+• AI Artifacts: tabs for Action Plan, Cluster Labels, Internal Links; JSON-validity indicator.
+• Logs UI: filter by trace_id, level, stage, err_code; full-text search; export JSON.
